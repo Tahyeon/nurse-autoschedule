@@ -1,0 +1,193 @@
+#nurseFlowApp {
+    --bg: #fff;
+    --panel: #fff;
+    --line: #dde5ee;
+    --text: #172033;
+    --muted: #667085;
+    --blue: #2563eb;
+    --red: #d92d20;
+    --green: #067647;
+    --amber: #b54708;
+    --d: #dceeff;
+    --e: #ffe2bd;
+    --n: #eadcff;
+    --off: #e7eaee;
+    --md: #d7f7e5;
+    --wk: #fff4e6;
+    --hol: #fff0ba;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    line-height: 1.45;
+  }
+  #nurseFlowApp * { box-sizing: border-box; }
+  #nurseFlowApp button, #nurseFlowApp input, #nurseFlowApp select { font: inherit; }
+  #nurseFlowApp .wrap { max-width: 760px; margin: 0 auto; padding: 16px 12px 26px; }
+  #nurseFlowApp .app-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  #nurseFlowApp h1 { margin: 4px 0 12px; font-size: 23px; font-weight: 900; letter-spacing: 0; color: #111827; }
+  #nurseFlowApp h2 { margin: 0 0 12px; font-size: 17px; font-weight: 900; letter-spacing: 0; color: #172033; }
+  #nurseFlowApp .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin: 12px 0; box-shadow: 0 6px 18px rgba(15,23,42,.04); }
+  #nurseFlowApp .tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0 12px; }
+  #nurseFlowApp .tab { background: #f3f6fa; color: #243044; border: 1px solid #e2e8f0; }
+  #nurseFlowApp .tab.active { background: var(--blue); border-color: var(--blue); color: #fff; }
+  #nurseFlowApp label { display: block; margin: 0 0 5px; color: var(--muted); font-size: 12px; font-weight: 800; }
+  #nurseFlowApp input, #nurseFlowApp select, #nurseFlowApp textarea { width: 100%; min-height: 42px; border: 1px solid #c9d3df; border-radius: 8px; background: #fff; color: var(--text); padding: 9px 10px; }
+  #nurseFlowApp input:focus, #nurseFlowApp select:focus, #nurseFlowApp textarea:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
+  #nurseFlowApp textarea { min-height: 120px; resize: vertical; }
+  #nurseFlowApp button { min-height: 44px; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; background: #f3f6fa; color: #243044; font-weight: 900; cursor: pointer; }
+  #nurseFlowApp button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  #nurseFlowApp button:disabled { opacity: .62; cursor: wait; }
+  #nurseFlowApp button.danger { background: #fff5f5; border-color: #fecaca; color: var(--red); }
+  #nurseFlowApp button.small { min-height: 34px; padding: 7px 9px; border-radius: 8px; font-size: 12px; }
+  #nurseFlowApp .icon-btn { width: 42px; min-height: 42px; padding: 0; border-radius: 999px; font-size: 22px; line-height: 1; flex: 0 0 auto; }
+  #nurseFlowApp .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+  #nurseFlowApp .label-line { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; margin: 0 0 5px; }
+  #nurseFlowApp .label-line label { margin: 0; }
+  #nurseFlowApp .warn-note { color: var(--red); font-size: 11px; font-weight: 900; line-height: 1.25; text-align: right; }
+  #nurseFlowApp .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  #nurseFlowApp .one { grid-template-columns: 1fr; }
+  #nurseFlowApp .nurse-role-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start; }
+  #nurseFlowApp .hidden { display: none !important; }
+  #nurseFlowApp .soft-divider { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+  #nurseFlowApp .legacy-cloud { display: none !important; }
+  #nurseFlowApp .muted { color: var(--muted); font-size: 12px; }
+  #nurseFlowApp .name-list { display: grid; gap: 7px; max-height: 260px; overflow: auto; margin-top: 9px; }
+  #nurseFlowApp .name-list.compact { max-height: 172px; }
+  #nurseFlowApp .name-btn { text-align: left; background: #fff; border: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+  #nurseFlowApp .name-btn.active { border-color: #2563eb; background: #eff6ff; color: #174ea6; }
+  #nurseFlowApp .badge { display: inline-block; padding: 3px 7px; border-radius: 999px; background: #edf3ff; color: #175cd3; font-size: 11px; font-weight: 900; }
+  #nurseFlowApp .day-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 10px; }
+  #nurseFlowApp .day-chip { min-height: 42px; padding: 5px 2px; border: 1px solid var(--line); background: #fff; border-radius: 8px; font-size: 13px; }
+  #nurseFlowApp .day-chip.sel { background: #dbeafe; border-color: #60a5fa; color: #174ea6; }
+  #nurseFlowApp .day-chip.req-D { border-color: #ef4444; box-shadow: inset 0 0 0 2px rgba(239,68,68,.45); }
+  #nurseFlowApp .day-chip.req-E { border-color: #f59e0b; box-shadow: inset 0 0 0 2px rgba(245,158,11,.45); }
+  #nurseFlowApp .day-chip.req-N { border-color: #7c3aed; box-shadow: inset 0 0 0 2px rgba(124,58,237,.45); }
+  #nurseFlowApp .day-chip.req-OFF { border-color: #64748b; box-shadow: inset 0 0 0 2px rgba(100,116,139,.45); }
+  #nurseFlowApp .day-chip.full { background: #fee4e2; color: #912018; }
+  #nurseFlowApp .day-chip.weekend { background: var(--wk); }
+  #nurseFlowApp .day-chip.holiday { background: var(--hol); }
+  #nurseFlowApp .req-list { display: grid; gap: 7px; margin-top: 10px; }
+  #nurseFlowApp .schedule-options { display: grid; gap: 8px; }
+  #nurseFlowApp .option-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fff; }
+  #nurseFlowApp .option-row.active { border-color: #2563eb; background: #eff6ff; }
+  #nurseFlowApp .option-row b { display: block; font-size: 15px; }
+  #nurseFlowApp .option-row span { display: block; color: var(--muted); font-size: 12px; font-weight: 800; }
+  #nurseFlowApp .ok-text { color: var(--green); font-weight: 900; white-space: nowrap; }
+  #nurseFlowApp .danger-text { color: var(--red); font-weight: 900; white-space: nowrap; }
+  #nurseFlowApp .req-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 9px; background: #fff; }
+  #nurseFlowApp .req-row.grouped { grid-template-columns: minmax(96px, .45fr) 1fr; align-items: start; }
+  #nurseFlowApp .req-person b { display: block; font-size: 15px; }
+  #nurseFlowApp .req-person span { display: block; color: var(--muted); font-size: 11px; font-weight: 900; }
+  #nurseFlowApp .req-days { display: flex; flex-wrap: wrap; gap: 6px; }
+  #nurseFlowApp .req-chip { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 4px 5px 4px 9px; border-radius: 999px; background: #f3f6fa; border: 1px solid var(--line); font-size: 12px; font-weight: 900; }
+  #nurseFlowApp .mini-x { width: 22px; min-height: 22px; padding: 0; border-radius: 999px; color: var(--red); background: #fff5f5; border-color: #fecaca; line-height: 1; }
+  #nurseFlowApp .msg { border-radius: 8px; padding: 10px 11px; margin: 7px 0; border: 1px solid var(--line); background: #fff; font-size: 13px; }
+  #nurseFlowApp .msg.error { background: #fff1f0; border-color: #fda29b; color: #912018; }
+  #nurseFlowApp .msg.warn { background: #fffaeb; border-color: #fedf89; color: #93370d; }
+  #nurseFlowApp .msg.ok { background: #ecfdf3; border-color: #abefc6; color: var(--green); font-weight: 900; }
+  #nurseFlowApp .scroll { width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: #fff; -webkit-overflow-scrolling: touch; }
+  #nurseFlowApp table { border-collapse: collapse; width: 100%; }
+  #nurseFlowApp th, #nurseFlowApp td { border: 1px solid var(--line); min-width: 42px; height: 36px; padding: 3px; text-align: center; white-space: nowrap; }
+  #nurseFlowApp th { background: #f8fafc; font-weight: 900; }
+  #nurseFlowApp .sticky { position: sticky; left: 0; z-index: 2; min-width: 92px; max-width: 92px; background: #fff; text-align: left; padding-left: 7px; box-shadow: 1px 0 0 var(--line); }
+  #nurseFlowApp thead .sticky { z-index: 3; background: #f8fafc; }
+  #nurseFlowApp .role { display: block; color: var(--muted); font-size: 10px; font-weight: 700; }
+  #nurseFlowApp .dow { display: block; color: var(--muted); font-size: 10px; }
+  #nurseFlowApp .cell { border-radius: 7px; font-weight: 900; cursor: pointer; user-select: none; }
+  #nurseFlowApp .s-D { background: var(--d); color: #15507f; }
+  #nurseFlowApp .s-E { background: var(--e); color: #8a4b00; }
+  #nurseFlowApp .s-N { background: var(--n); color: #553093; }
+  #nurseFlowApp .s-OFF { background: var(--off); color: #4b5563; font-size: 11px; }
+  #nurseFlowApp .s-MD { background: var(--md); color: #067647; }
+  #nurseFlowApp .weekend { background-color: var(--wk); }
+  #nurseFlowApp .holiday { background-color: var(--hol); }
+  #nurseFlowApp .empty { padding: 20px 8px; text-align: center; color: var(--muted); }
+  #nurseFlowApp .mine { margin: 9px 0 0; padding: 9px 10px; border-radius: 8px; background: #f8fafc; color: var(--text); font-size: 13px; border: 1px solid var(--line); }
+  #nurseFlowApp .personal-card { margin-bottom: 10px; }
+  #nurseFlowApp .today-hero { margin: 16px 0 12px; padding: 4px 0; }
+  #nurseFlowApp .today-hero h2 { margin-bottom: 5px; font-size: 24px; }
+  #nurseFlowApp .today-date { color: var(--muted); font-size: 13px; font-weight: 900; }
+  #nurseFlowApp .today-date-picker { margin-top: 10px; }
+  #nurseFlowApp .today-workers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 10px 0 14px; }
+  #nurseFlowApp .today-card { border-radius: 8px; padding: 8px; color: #fff; box-shadow: 0 8px 22px rgba(15,23,42,.08); min-width: 0; }
+  #nurseFlowApp .today-card-head { display: grid; gap: 3px; margin-bottom: 7px; text-align: center; }
+  #nurseFlowApp .today-card-head strong { font-size: 16px; line-height: 1.1; }
+  #nurseFlowApp .today-card-head span { justify-self: center; padding: 3px 7px; border-radius: 999px; background: rgba(255,255,255,.2); font-size: 10px; font-weight: 900; }
+  #nurseFlowApp .today-name-list { display: grid; gap: 5px; }
+  #nurseFlowApp .today-name { display: grid; gap: 3px; min-height: 48px; padding: 7px 6px; border-radius: 8px; background: rgba(255,255,255,.18); }
+  #nurseFlowApp .today-name b { display: block; font-size: 15px; line-height: 1.15; overflow-wrap: anywhere; }
+  #nurseFlowApp .today-name span { display: block; font-size: 12px; font-weight: 900; opacity: .9; }
+  #nurseFlowApp .today-name em { color: rgba(255,255,255,.96); font-style: normal; font-size: 12px; font-weight: 900; line-height: 1.2; overflow-wrap: anywhere; }
+  #nurseFlowApp .acting-summary { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fff; color: var(--text); }
+  #nurseFlowApp .acting-summary h3 { margin: 0 0 8px; font-size: 15px; }
+  #nurseFlowApp .acting-summary-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  #nurseFlowApp .acting-chip { display: inline-flex; gap: 5px; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 5px 8px; background: #f8fafc; font-size: 12px; font-weight: 900; }
+  #nurseFlowApp .today-empty { padding: 10px; border-radius: 8px; background: rgba(255,255,255,.18); font-weight: 900; text-align: center; }
+  #nurseFlowApp .today-assign-card { margin-top: 12px; }
+  #nurseFlowApp .bed-assign-panel { display: grid; gap: 8px; margin-top: 10px; }
+  #nurseFlowApp .bed-row { display: grid; grid-template-columns: minmax(92px, .7fr) 1fr; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: #fff; }
+  #nurseFlowApp .bed-row b { display: block; font-size: 14px; }
+  #nurseFlowApp .bed-row span { display: block; color: var(--muted); font-size: 11px; font-weight: 900; }
+  #nurseFlowApp .bed-input-wrap { display: grid; grid-template-columns: 1fr 78px; gap: 7px; align-items: center; }
+  #nurseFlowApp .comma-btn { min-height: 42px; padding: 0; font-size: 22px; line-height: 1; }
+  #nurseFlowApp .acting-btn.active { background: #111827; border-color: #111827; color: #fff; }
+  #nurseFlowApp input.acting-input { background: #f3f4f6; color: #111827; font-weight: 900; }
+  #nurseFlowApp .shift-choice.req-D { border-color: #ef4444; color: #991b1b; background: #fff5f5; }
+  #nurseFlowApp .shift-choice.req-E { border-color: #f59e0b; color: #92400e; background: #fffbeb; }
+  #nurseFlowApp .shift-choice.req-N { border-color: #7c3aed; color: #4c1d95; background: #f5f3ff; }
+  #nurseFlowApp .shift-choice.req-OFF { border-color: #64748b; color: #334155; background: #f8fafc; }
+  #nurseFlowApp .personal-calendar-shell { margin: 12px 0; }
+  #nurseFlowApp .personal-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+  #nurseFlowApp .personal-card-head h2 { margin: 0; }
+  #nurseFlowApp .personal-card-head button:disabled { opacity: .45; cursor: not-allowed; }
+  #nurseFlowApp .personal-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 4px 0 10px; }
+  #nurseFlowApp .personal-title strong { display: block; font-size: 27px; line-height: 1.1; color: #111827; letter-spacing: 0; }
+  #nurseFlowApp .personal-title span { display: block; margin-top: 5px; color: var(--muted); font-size: 13px; font-weight: 800; }
+  #nurseFlowApp .personal-counts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin: 8px 0 12px; }
+  #nurseFlowApp .personal-count { min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 4px; border-radius: 8px; color: #fff; font-size: 12px; font-weight: 900; }
+  #nurseFlowApp .personal-count b { font-weight: 900; }
+  #nurseFlowApp .personal-weekdays { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; color: #667085; font-size: 12px; font-weight: 900; text-align: center; margin-bottom: 5px; }
+  #nurseFlowApp .personal-calendar { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+  #nurseFlowApp .personal-day { min-height: 82px; border: 1px solid #d9e2ed; border-radius: 8px; background: #fff; padding: 5px; overflow: hidden; }
+  #nurseFlowApp .personal-day.weekend { background: #fff8f0; }
+  #nurseFlowApp .personal-day.holiday { background: #fff2c7; }
+  #nurseFlowApp .personal-day.muted-day { background: transparent; border-color: transparent; }
+  #nurseFlowApp .personal-date { display: flex; align-items: baseline; justify-content: space-between; gap: 3px; margin-bottom: 5px; color: #172033; }
+  #nurseFlowApp .personal-date span { font-size: 15px; font-weight: 900; line-height: 1; }
+  #nurseFlowApp .personal-date em { color: #667085; font-style: normal; font-size: 10px; font-weight: 900; }
+  #nurseFlowApp .personal-shift { min-height: 42px; display: flex; align-items: center; justify-content: center; border-radius: 7px; padding: 5px 2px; color: #fff; font-size: 17px; font-weight: 900; line-height: 1.1; text-align: center; }
+  #nurseFlowApp .personal-mark { margin-top: 4px; color: #175cd3; font-size: 10px; font-weight: 900; white-space: nowrap; }
+  #nurseFlowApp .personal-empty { border: 1px solid var(--line); background: #f8fafc; color: var(--muted); border-radius: 8px; padding: 18px 12px; text-align: center; font-weight: 800; }
+  #nurseFlowApp .ps-D { background: #8aa2df; }
+  #nurseFlowApp .ps-E { background: #bd72e4; }
+  #nurseFlowApp .ps-N { background: #34d3ad; }
+  #nurseFlowApp .ps-OFF { background: #e69a6c; }
+  #nurseFlowApp .ps-MD { background: #6ebf8a; }
+  #nurseFlowApp .ps-empty { background: #eef2f7; color: #98a2b3; }
+  #nurseFlowApp .overlay { position: fixed; inset: 0; z-index: 999999; display: flex; align-items: center; justify-content: center; background: rgba(15, 23, 42, .34); padding: 22px; }
+  #nurseFlowApp .overlay-box { width: 100%; max-width: 320px; border-radius: 10px; background: #fff; padding: 22px 16px; text-align: center; box-shadow: 0 18px 60px rgba(15, 23, 42, .28); font-size: 20px; font-weight: 900; }
+  @media (max-width: 430px) {
+    #nurseFlowApp .wrap { padding: 10px; }
+    #nurseFlowApp h1 { font-size: 20px; }
+    #nurseFlowApp .tabs { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+    #nurseFlowApp .tab { min-height: 42px; padding: 8px 6px; font-size: 13px; }
+    #nurseFlowApp .grid, #nurseFlowApp .actions { grid-template-columns: 1fr; }
+    #nurseFlowApp .nurse-role-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+    #nurseFlowApp .nurse-role-grid textarea { min-height: 150px; font-size: 12px; padding: 7px; }
+    #nurseFlowApp .sticky { min-width: 84px; max-width: 84px; }
+    #nurseFlowApp .personal-title strong { font-size: 24px; }
+    #nurseFlowApp .personal-counts { grid-template-columns: repeat(2, 1fr); }
+    #nurseFlowApp .personal-day { min-height: 70px; padding: 4px; }
+    #nurseFlowApp .personal-shift { min-height: 36px; font-size: 14px; }
+    #nurseFlowApp .personal-mark { font-size: 9px; }
+    #nurseFlowApp .today-hero h2 { font-size: 20px; }
+    #nurseFlowApp .today-date { font-size: 12px; }
+    #nurseFlowApp .today-workers { gap: 4px; }
+    #nurseFlowApp .today-card { padding: 6px 4px; }
+    #nurseFlowApp .today-card-head strong { font-size: 14px; }
+    #nurseFlowApp .today-name { padding: 6px 4px; }
+    #nurseFlowApp .today-name b { font-size: 14px; }
+    #nurseFlowApp .today-name span, #nurseFlowApp .today-name em { font-size: 11px; }
+    #nurseFlowApp .bed-row { grid-template-columns: 1fr; }
+    #nurseFlowApp .req-row.grouped { grid-template-columns: 1fr; }
+  }

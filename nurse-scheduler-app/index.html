@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#2563eb">
+  <meta name="description" content="간호사 근무 신청과 근무표 자동 생성을 위한 병동용 웹앱">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="근무표 생성기">
+  <title>&#44036;&#54840;&#49324; &#44540;&#47924;&#54364; &#51088;&#46041; &#49373;&#49457;&#44592;</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="icons/favicon.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+</head>
+<body>
+<div id="nurseFlowApp">
+  <div class="wrap">
+    <div class="app-head">
+      <h1 data-t="appTitle"></h1>
+      <button id="nfRefresh" class="icon-btn" type="button" aria-label="새로고침" title="새로고침">↻</button>
+    </div>
+    <div class="tabs">
+      <button id="nfNurseTab" class="tab active" type="button" data-t="nurseMode"></button>
+      <button id="nfHeadTab" class="tab" type="button" data-t="headMode"></button>
+      <button id="nfTodayTab" class="tab" type="button" data-t="todayMode"></button>
+      <button id="nfMyScheduleTab" class="tab" type="button" data-t="myScheduleMode"></button>
+    </div>
+
+    <section id="nfNurseView">
+      <div class="card">
+        <h2 data-t="loginTitle"></h2>
+        <div class="grid">
+          <div><label data-t="year"></label><input id="nfReqYear" type="number" min="2024" max="2100"></div>
+          <div><label data-t="month"></label><select id="nfReqMonth"></select></div>
+        </div>
+        <div class="label-line legacy-cloud"><label data-t="cloudUrl"></label><span class="warn-note" data-t="cloudWarn"></span></div>
+        <input id="nfCloudUrl" class="legacy-cloud" autocomplete="off">
+        <div id="nfCloudStatus" class="muted"></div>
+        <label data-t="searchName"></label>
+        <input id="nfNameSearch" autocomplete="off">
+        <div id="nfNameList" class="name-list"></div>
+      </div>
+      <div id="nfOffPanel" class="card hidden">
+        <h2 id="nfLoginName"></h2>
+        <div id="nfMyRequests" class="mine"></div>
+        <label data-t="inspectOff" style="display:none"></label>
+        <select id="nfInspectDay" style="display:none"></select>
+        <div class="muted" data-t="offHelp"></div>
+        <div id="nfDayGrid" class="day-grid"></div>
+        <div id="nfInspectResult" class="mine"></div>
+        <div id="nfShiftChoices" class="actions"></div>
+        <div id="nfOffMessage"></div>
+        <div class="actions">
+          <button id="nfLogout" type="button" data-t="logout"></button>
+          <button id="nfSubmitMine" class="primary" type="button" data-t="submitOff"></button>
+          <button id="nfClearMine" class="danger" type="button" data-t="clearMine"></button>
+        </div>
+      </div>
+    </section>
+
+    <section id="nfHeadView" class="hidden">
+      <div class="card">
+        <h2 data-t="settings"></h2>
+        <div class="grid">
+          <div><label data-t="year"></label><input id="nfYear" type="number" min="2024" max="2100"></div>
+          <div><label data-t="month"></label><select id="nfMonth"></select></div>
+          <div><label data-t="holidays"></label><input id="nfHolidays" autocomplete="off" placeholder="1, 6, 15"></div>
+          <div class="legacy-cloud"><div class="label-line"><label data-t="cloudUrl"></label><span class="warn-note" data-t="cloudWarn"></span></div><input id="nfCloudUrlHead"></div>
+          <div><label data-t="offQuota"></label><input id="nfOffQuota" type="number" min="0" max="15" value="10"></div>
+          <div><label data-t="maxOffTotal"></label><input id="nfMaxOffTotal" type="number" min="0" max="20" value="12"></div>
+          <div><label data-t="needD"></label><input id="nfNeedD" type="number" min="7" value="8"></div>
+          <div><label data-t="needE"></label><input id="nfNeedE" type="number" min="7" value="8"></div>
+          <div><label data-t="needN"></label><input id="nfNeedN" type="number" min="7" value="7"></div>
+          <div><label data-t="maxD"></label><input id="nfMaxD" type="number" min="7" value="10"></div>
+          <div><label data-t="maxE"></label><input id="nfMaxE" type="number" min="7" value="10"></div>
+          <div><label data-t="maxN"></label><input id="nfMaxN" type="number" min="7" value="7"></div>
+          <div><label data-t="tries"></label><input id="nfTries" type="number" min="20" max="300" value="160"></div>
+        </div>
+        <div class="actions">
+          <button id="nfGenerate" class="primary" type="button" data-t="generate"></button>
+          <button id="nfExcel" type="button" data-t="excel"></button>
+          <button id="nfReset" class="danger" type="button" data-t="reset"></button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 data-t="scheduleOptionsTitle"></h2>
+        <div id="nfScheduleOptions" class="schedule-options"></div>
+      </div>
+
+      <div class="card">
+        <h2 data-t="nurseManage"></h2>
+        <div class="grid nurse-role-grid">
+          <div><label data-t="chargeList"></label><textarea id="nfChargeList"></textarea></div>
+          <div><label data-t="midList"></label><textarea id="nfMidList"></textarea></div>
+          <div><label data-t="newList"></label><textarea id="nfNewList"></textarea></div>
+        </div>
+        <div class="actions"><button id="nfSaveNurses" class="primary" type="button" data-t="saveNurses"></button></div>
+      </div>
+
+      <div class="card">
+        <h2 data-t="requestStatus"></h2>
+        <div id="nfRequestList" class="req-list"></div>
+      </div>
+
+      <div class="card">
+        <h2 data-t="finalUploadTitle"></h2>
+        <div class="muted" data-t="previousUploadHelp"></div>
+        <input id="nfPreviousExcelFile" type="file" accept=".xlsx,.xls,.csv,.html,.htm">
+        <div id="nfPreviousUploadStatus" class="mine"></div>
+        <div class="actions">
+          <button id="nfPreviousUploadClear" class="danger" type="button" data-t="previousUploadClear"></button>
+        </div>
+        <hr class="soft-divider">
+        <div class="muted" data-t="finalUploadHelp"></div>
+        <input id="nfFinalExcelFile" type="file" accept=".xlsx,.xls,.csv,.html,.htm">
+        <div id="nfFinalUploadStatus" class="mine"></div>
+        <div class="actions">
+          <button id="nfFinalUploadClear" class="danger" type="button" data-t="finalUploadClear"></button>
+        </div>
+      </div>
+    </section>
+
+    <section id="nfTodayView" class="hidden">
+      <div class="today-hero">
+        <h2 data-t="todayTitle"></h2>
+        <div id="nfTodayDate" class="today-date"></div>
+        <div class="grid today-date-picker">
+          <div><label data-t="year"></label><input id="nfTodayYear" type="number" min="2024" max="2100"></div>
+          <div><label data-t="month"></label><select id="nfTodayMonth"></select></div>
+          <div><label data-t="todayDay"></label><select id="nfTodayDay"></select></div>
+        </div>
+      </div>
+      <div id="nfTodayWorkers" class="today-workers"></div>
+      <div class="card today-assign-card">
+        <h2 data-t="bedAssignTitle"></h2>
+        <div class="muted" data-t="bedAssignHelp"></div>
+        <div class="grid">
+          <div>
+            <label data-t="chargeAuth"></label>
+            <select id="nfChargeAuthName"></select>
+          </div>
+          <div>
+            <label data-t="bedAssignDay"></label>
+            <select id="nfBedAssignDay"></select>
+          </div>
+          <div>
+            <label data-t="bedAssignShift"></label>
+            <select id="nfBedAssignShift"></select>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="nfOpenBedAssign" type="button" data-t="openBedAssign"></button>
+          <button id="nfSaveBedAssign" class="primary hidden" type="button" data-t="saveBedAssign"></button>
+        </div>
+        <div id="nfBedAssignPanel" class="bed-assign-panel hidden"></div>
+      </div>
+    </section>
+
+    <section id="nfMyScheduleView" class="hidden">
+      <div class="card personal-card">
+        <div class="personal-card-head">
+          <h2 data-t="myScheduleTitle"></h2>
+          <button id="nfSaveMyScheduleImage" class="small primary" type="button" data-t="saveGallery"></button>
+        </div>
+        <div class="grid">
+          <div><label data-t="year"></label><input id="nfMyYear" type="number" min="2024" max="2100"></div>
+          <div><label data-t="month"></label><select id="nfMyMonth"></select></div>
+        </div>
+        <label data-t="myScheduleSearch"></label>
+        <input id="nfMyScheduleSearch" autocomplete="off">
+        <div id="nfMyScheduleNameList" class="name-list compact"></div>
+      </div>
+      <div class="personal-calendar-shell">
+        <div id="nfMyScheduleSummary"></div>
+        <div id="nfMyScheduleCalendar"></div>
+      </div>
+    </section>
+
+    <section id="nfScheduleCard" class="card">
+      <h2><span data-t="schedule"></span> <span id="nfScore" class="badge"></span></h2>
+      <div id="nfSchedule"></div>
+    </section>
+    <div id="nfDoneOverlay" class="overlay hidden"><div class="overlay-box" data-t="done"></div></div>
+  </div>
+</div>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('./service-worker.js').catch(function () {});
+      });
+    }
+  </script>
+</body>
+</html>
