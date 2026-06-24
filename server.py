@@ -452,6 +452,7 @@ def success_response(schedule: Dict[str, List[str]], validation: Dict[str, Any],
         "individual_shift_counts": validation["individual_shift_counts"],
         "off_summary": validation["off_summary"],
         "night_distribution": validation["night_distribution"],
+        "transition_violations": validation["transition_violations"],
         "special_rule_results": validation["special_rule_results"],
         "next_month_carryover_off": validation["next_month_carryover_off"],
     }
@@ -499,6 +500,7 @@ def failure_response(
         "individual_shift_counts": [] if validation is None else validation.get("individual_shift_counts", []),
         "off_summary": [] if validation is None else validation.get("off_summary", []),
         "night_distribution": [] if validation is None else validation.get("night_distribution", []),
+        "transition_violations": [] if validation is None else validation.get("transition_violations", []),
         "special_rule_results": [] if validation is None else validation.get("special_rule_results", []),
         "next_month_carryover_off": [] if validation is None else validation.get("next_month_carryover_off", []),
         "input_summary": {
@@ -527,6 +529,7 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
     individual: List[Dict[str, Any]] = []
     off_summary: List[Dict[str, Any]] = []
     night_distribution: List[Dict[str, Any]] = []
+    transition_violations: List[Dict[str, Any]] = []
     special_rule_results: List[Dict[str, Any]] = []
     next_month_carryover_off: List[Dict[str, Any]] = []
 
@@ -539,7 +542,8 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
         row = (schedule.get(nid, []) + [""] * num_days)[:num_days]
         counts = Counter(row)
         individual.append({"nurseId": nid, "name": nurse_name(nurse), "role": nurse.get("role"), "grade": role_group(nurse.get("role")), "D": counts["D"], "E": counts["E"], "N": counts["N"], "OFF": counts["OFF"]})
-        off_summary.append({"nurseId": nid, "name": nurse_name(nurse), "required_off": target_off, "actual_off": counts["OFF"], "off_difference": counts["OFF"] - target_off})
+        off_diff = counts["OFF"] - target_off
+        off_summary.append({"nurseId": nid, "name": nurse_name(nurse), "required_off": target_off, "actual_off": counts["OFF"], "off_difference": off_diff, "difference": off_diff})
         for value in (night_floor, night_floor + 1):
             if counts["N"] == value:
                 break
@@ -554,9 +558,13 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
             hard.append({"type": "off_target_mismatch", "nurseId": nid, "name": nurse_name(nurse), "actual": counts["OFF"], "required": target_off, "diff": counts["OFF"] - target_off})
         for day in range(1, num_days):
             if row[day - 1] == "E" and row[day] == "D":
-                hard.append({"type": "evening_to_day", "nurseId": nid, "name": nurse_name(nurse), "fromDay": day, "toDay": day + 1})
+                item = {"type": "E_TO_D", "nurseId": nid, "nurse": nurse_name(nurse), "name": nurse_name(nurse), "from_date": day, "to_date": day + 1, "fromDay": day, "toDay": day + 1}
+                transition_violations.append(item)
+                hard.append(item)
             if row[day - 1] == "N" and row[day] in {"D", "E"}:
-                hard.append({"type": "night_next_day_work", "nurseId": nid, "name": nurse_name(nurse), "fromDay": day, "toDay": day + 1, "actual": row[day]})
+                item = {"type": "N_TO_WORK", "nurseId": nid, "nurse": nurse_name(nurse), "name": nurse_name(nurse), "from_date": day, "to_date": day + 1, "fromDay": day, "toDay": day + 1, "actual": row[day]}
+                transition_violations.append(item)
+                hard.append(item)
 
         previous_run = previous_night_run_at_end(payload.previousSchedule, nid)
         day = 1
@@ -670,6 +678,7 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
         "individual_shift_counts": individual,
         "off_summary": off_summary,
         "night_distribution": night_distribution,
+        "transition_violations": transition_violations,
         "special_rule_results": special_rule_results,
         "next_month_carryover_off": next_month_carryover_off,
     }
