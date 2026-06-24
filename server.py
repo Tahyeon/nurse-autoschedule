@@ -13,6 +13,13 @@ SHIFTS = ("D", "E", "N", "OFF")
 WORK_SHIFTS = ("D", "E", "N")
 WORK_GROUPS = {"charge", "middle", "junior"}
 LEE_HYEMI = "\uc774\ud61c\ubbf8"
+SPECIAL_NIGHT_RULES = {
+    LEE_HYEMI: {
+        "night_total": 6,
+        "block_count": 2,
+        "block_lengths": [3, 3],
+    }
+}
 DEFAULT_TIME_LIMIT_SECONDS = 60
 
 
@@ -80,6 +87,10 @@ def request_shift(req: Dict[str, Any]) -> str:
 
 def preferred_night_lengths(nurse: Dict[str, Any]) -> List[int]:
     return [3] if nurse_name(nurse) == LEE_HYEMI else [2, 3]
+
+
+def special_night_rule(nurse: Dict[str, Any]) -> Dict[str, Any] | None:
+    return SPECIAL_NIGHT_RULES.get(nurse_name(nurse))
 
 
 def previous_night_run_at_end(previous: Dict[str, List[str]], nurse_id: str) -> int:
@@ -245,12 +256,12 @@ def build_precheck(
     if total_nights > worker_count * num_days:
         problems.append({"type": "night_total_too_high", "total_nights": total_nights})
     for nurse in workers:
-        allowed = preferred_night_lengths(nurse)
-        possible = any((night_floor if high == 0 else night_floor + 1) % length == 0 or length != 3 for high in (0, 1) for length in allowed)
-        if nurse_name(nurse) == LEE_HYEMI and not possible:
+        rule = special_night_rule(nurse)
+        if rule and int(rule["night_total"]) not in {night_floor, night_floor + 1}:
             problems.append({
                 "type": "hye_mi_night_block_impossible",
-                "message": "Lee Hye-mi must receive only 3-night blocks, but floor/ceil night target is incompatible.",
+                "message": "Lee Hye-mi must receive exactly six nights in two 3-night blocks, but floor/ceil night target is incompatible.",
+                "special_rule": rule,
                 "night_floor": night_floor,
                 "night_remainder": night_remainder,
             })
@@ -320,7 +331,12 @@ def solve(payload: SolveRequest) -> Dict[str, Any]:
     for nurse in workers:
         nid = nurse["id"]
         row_nights = [x[(nid, day, "N")] for day in range(1, num_days + 1)]
-        model.Add(sum(row_nights) == night_floor + high_night[nid])
+        rule = special_night_rule(nurse)
+        if rule:
+            model.Add(high_night[nid] == int(rule["night_total"]) - night_floor)
+            model.Add(sum(row_nights) == int(rule["night_total"]))
+        else:
+            model.Add(sum(row_nights) == night_floor + high_night[nid])
         model.Add(sum(x[(nid, day, "OFF")] for day in range(1, num_days + 1)) == target_off)
 
         for day in range(1, num_days):
@@ -342,6 +358,10 @@ def solve(payload: SolveRequest) -> Dict[str, Any]:
                     generated_cover[day].append(b)
                 for off_day in range(start + length, min(num_days, start + length + 1) + 1):
                     model.Add(x[(nid, off_day, "OFF")] == 1).OnlyEnforceIf(b)
+
+        if rule:
+            nurse_blocks = [var for (block_nid, _start, length), var in blocks.items() if block_nid == nid and length == 3]
+            model.Add(sum(nurse_blocks) == int(rule["block_count"]))
 
         for day in range(1, num_days + 1):
             if day in carried_nights:
@@ -432,6 +452,8 @@ def success_response(schedule: Dict[str, List[str]], validation: Dict[str, Any],
         "individual_shift_counts": validation["individual_shift_counts"],
         "off_summary": validation["off_summary"],
         "night_distribution": validation["night_distribution"],
+        "special_rule_results": validation["special_rule_results"],
+        "next_month_carryover_off": validation["next_month_carryover_off"],
     }
 
 
@@ -477,6 +499,8 @@ def failure_response(
         "individual_shift_counts": [] if validation is None else validation.get("individual_shift_counts", []),
         "off_summary": [] if validation is None else validation.get("off_summary", []),
         "night_distribution": [] if validation is None else validation.get("night_distribution", []),
+        "special_rule_results": [] if validation is None else validation.get("special_rule_results", []),
+        "next_month_carryover_off": [] if validation is None else validation.get("next_month_carryover_off", []),
         "input_summary": {
             "year": payload.year,
             "month": payload.month,
@@ -503,6 +527,8 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
     individual: List[Dict[str, Any]] = []
     off_summary: List[Dict[str, Any]] = []
     night_distribution: List[Dict[str, Any]] = []
+    special_rule_results: List[Dict[str, Any]] = []
+    next_month_carryover_off: List[Dict[str, Any]] = []
 
     for item in precheck or []:
         if item.get("type") == "off_request_conflicts":
@@ -534,6 +560,7 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
 
         previous_run = previous_night_run_at_end(payload.previousSchedule, nid)
         day = 1
+        current_month_night_blocks: List[int] = []
         while day <= num_days:
             if row[day - 1] != "N":
                 day += 1
@@ -542,6 +569,7 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
             while day <= num_days and row[day - 1] == "N":
                 day += 1
             length = day - start
+            current_month_night_blocks.append(length)
             total_length = length + previous_run if start == 1 else length
             allowed = preferred_night_lengths(nurse)
             if total_length not in allowed:
@@ -550,12 +578,40 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
                 hard.append({"type": "single_night", "nurseId": nid, "name": nurse_name(nurse), "day": start})
             if total_length >= 4:
                 hard.append({"type": "night_run_too_long", "nurseId": nid, "name": nurse_name(nurse), "startDay": start, "length": total_length})
-            if day <= num_days:
-                for off_day in range(day, min(num_days, day + 1) + 1):
+            future_off_days = []
+            for off_day in range(day, day + 2):
+                if off_day <= num_days:
                     if row[off_day - 1] != "OFF":
                         hard.append({"type": "night_recovery_off_missing", "nurseId": nid, "name": nurse_name(nurse), "nightStartDay": start, "day": off_day, "actual": row[off_day - 1]})
-            else:
-                warnings.append({"type": "boundary_warning", "nurseId": nid, "name": nurse_name(nurse), "message": "Night block ends at month boundary; next-month recovery OFF must be checked."})
+                else:
+                    future_off_days.append(off_day - num_days)
+            if future_off_days:
+                carry_item = {
+                    "nurseId": nid,
+                    "nurse_name": nurse_name(nurse),
+                    "night_block_start_day": start,
+                    "night_block_length": length,
+                    "required_off_dates_next_month": future_off_days,
+                }
+                next_month_carryover_off.append(carry_item)
+                warnings.append({"type": "boundary_warning", **carry_item})
+
+        rule = special_night_rule(nurse)
+        if rule:
+            actual_blocks = sorted(current_month_night_blocks)
+            expected_blocks = sorted(int(v) for v in rule["block_lengths"])
+            ok = counts["N"] == int(rule["night_total"]) and actual_blocks == expected_blocks
+            result = {
+                "nurseId": nid,
+                "name": nurse_name(nurse),
+                "rule": rule,
+                "actual_night_total": counts["N"],
+                "actual_block_lengths": actual_blocks,
+                "passed": ok,
+            }
+            special_rule_results.append(result)
+            if not ok:
+                hard.append({"type": "special_night_rule_failed", **result})
 
     high_count = sum(1 for item in night_distribution if item["night_count"] == night_floor + 1)
     total_nights = sum(item["night_count"] for item in night_distribution)
@@ -614,6 +670,8 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], pre
         "individual_shift_counts": individual,
         "off_summary": off_summary,
         "night_distribution": night_distribution,
+        "special_rule_results": special_rule_results,
+        "next_month_carryover_off": next_month_carryover_off,
     }
 
 
