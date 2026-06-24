@@ -1,5 +1,6 @@
 from collections import Counter, defaultdict
 from datetime import datetime
+from math import floor
 from typing import Any, Dict, List, Tuple
 
 from fastapi import FastAPI
@@ -10,10 +11,8 @@ from pydantic import BaseModel, Field
 
 SHIFTS = ("D", "E", "N", "OFF")
 WORK_SHIFTS = ("D", "E", "N")
-WORK_ROLES = {"charge", "mid", "newn"}
-ROLE_LABEL = {"charge": "차지", "mid": "중간", "newn": "신규"}
-NIGHT_MIN = 7
-NIGHT_MAX = 8
+WORK_GROUPS = {"charge", "middle", "junior"}
+LEE_HYEMI = "\uc774\ud61c\ubbf8"
 DEFAULT_TIME_LIMIT_SECONDS = 60
 
 
@@ -47,16 +46,23 @@ def days_in_month(year: int, month: int) -> int:
     return (datetime(year, month + 1, 1) - datetime(year, month, 1)).days
 
 
-def worker_nurses(nurses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [n for n in nurses if n.get("role") in WORK_ROLES]
-
-
 def nurse_name(nurse: Dict[str, Any]) -> str:
     return str(nurse.get("name") or nurse.get("id") or "")
 
 
-def preferred_night_lengths(nurse: Dict[str, Any]) -> List[int]:
-    return [3] if nurse_name(nurse) == "이혜미" else [2, 3]
+def role_group(role: Any) -> str:
+    raw = str(role or "").strip().lower()
+    if raw in {"charge", "\ucc28\uc9c0"}:
+        return "charge"
+    if raw in {"mid", "middle", "acting", "\uc561\ud305", "\uc911\uac04"}:
+        return "middle"
+    if raw in {"newn", "junior", "\uc2e0\uaddc"}:
+        return "junior"
+    return raw
+
+
+def worker_nurses(nurses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [n for n in nurses if role_group(n.get("role")) in WORK_GROUPS]
 
 
 def normalize_shift(value: Any) -> str:
@@ -68,8 +74,45 @@ def normalize_shift(value: Any) -> str:
     return raw
 
 
+def request_shift(req: Dict[str, Any]) -> str:
+    return normalize_shift(req.get("shift") or req.get("type"))
+
+
+def preferred_night_lengths(nurse: Dict[str, Any]) -> List[int]:
+    return [3] if nurse_name(nurse) == LEE_HYEMI else [2, 3]
+
+
+def previous_night_run_at_end(previous: Dict[str, List[str]], nurse_id: str) -> int:
+    row = [normalize_shift(v) for v in (previous.get(nurse_id, []) or [])]
+    if not row or row[-1] != "N":
+        return 0
+    run = 0
+    for value in reversed(row):
+        if value != "N":
+            break
+        run += 1
+    return run
+
+
+def previous_carryover(previous: Dict[str, List[str]], nurse: Dict[str, Any], num_days: int) -> Dict[int, str]:
+    run = previous_night_run_at_end(previous, nurse["id"])
+    out: Dict[int, str] = {}
+    if run == 1:
+        target_len = 3 if nurse_name(nurse) == LEE_HYEMI else 2
+        extra_nights = max(1, target_len - run)
+        for day in range(1, min(extra_nights, num_days) + 1):
+            out[day] = "N"
+        for day in range(extra_nights + 1, min(extra_nights + 2, num_days) + 1):
+            out[day] = "OFF"
+    elif run >= 2:
+        out[1] = "OFF"
+        if num_days >= 2:
+            out[2] = "OFF"
+    return out
+
+
 def fixed_schedule_for(nurse: Dict[str, Any], year: int, month: int, num_days: int) -> List[str]:
-    role = nurse.get("role")
+    role = str(nurse.get("role") or "").lower()
     out = []
     for day in range(1, num_days + 1):
         weekday = datetime(year, month, day).weekday()
@@ -87,39 +130,22 @@ def fixed_schedule_for(nurse: Dict[str, Any], year: int, month: int, num_days: i
     return out
 
 
-def previous_night_run_at_end(previous: Dict[str, List[str]], nurse_id: str) -> int:
-    arr = previous.get(nurse_id, []) or []
-    if not arr or arr[-1] != "N":
-        return 0
-    run = 0
-    for value in reversed(arr):
-        if value == "N":
-            run += 1
-        else:
-            break
-    return run
+def daily_needs(payload: SolveRequest) -> Tuple[Dict[str, int], Dict[str, int]]:
+    min_need = {
+        "D": max(1, int(payload.needs.get("D") or 8)),
+        "E": max(1, int(payload.needs.get("E") or 8)),
+        "N": max(1, int(payload.needs.get("N") or 7)),
+    }
+    max_need = {
+        "D": max(min_need["D"], int(payload.maxNeeds.get("D") or 10)),
+        "E": max(min_need["E"], int(payload.maxNeeds.get("E") or 9)),
+        "N": max(min_need["N"], int(payload.maxNeeds.get("N") or 8)),
+    }
+    return min_need, max_need
 
 
-def previous_carryover(previous: Dict[str, List[str]], nurse: Dict[str, Any], num_days: int) -> Dict[int, str]:
-    nid = nurse["id"]
-    run = previous_night_run_at_end(previous, nid)
-    out: Dict[int, str] = {}
-    if run == 1:
-        target_len = 3 if nurse_name(nurse) == "이혜미" else 2
-        extra_nights = max(1, target_len - run)
-        for day in range(1, min(extra_nights, num_days) + 1):
-            out[day] = "N"
-        for day in range(extra_nights + 1, min(extra_nights + 2, num_days) + 1):
-            out[day] = "OFF"
-    elif run >= 2:
-        out[1] = "OFF"
-        if num_days >= 2:
-            out[2] = "OFF"
-    return out
-
-
-def request_shift(req: Dict[str, Any]) -> str:
-    return normalize_shift(req.get("shift") or req.get("type"))
+def off_target(payload: SolveRequest) -> int:
+    return int(payload.offTarget if payload.offTarget is not None else payload.baseOff if payload.baseOff is not None else 11)
 
 
 def grouped_off_requests(payload: SolveRequest, workers: List[Dict[str, Any]]) -> Tuple[Dict[Tuple[str, int], str], List[Dict[str, Any]]]:
@@ -128,19 +154,25 @@ def grouped_off_requests(payload: SolveRequest, workers: List[Dict[str, Any]]) -
     accepted: Dict[Tuple[str, int], str] = {}
     conflicts: List[Dict[str, Any]] = []
     by_day: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    by_day_role: Dict[Tuple[int, str], List[Dict[str, Any]]] = defaultdict(list)
+    by_day_grade: Dict[Tuple[int, str], List[Dict[str, Any]]] = defaultdict(list)
     num_days = days_in_month(payload.year, payload.month)
 
     for req in payload.requests:
         nid = req.get("nurseId")
         day = int(req.get("day") or 0)
-        shift = request_shift(req)
-        if nid not in worker_ids or not (1 <= day <= num_days) or shift != "OFF":
+        if nid not in worker_ids or not (1 <= day <= num_days) or request_shift(req) != "OFF":
             continue
         nurse = by_id[nid]
-        item = {"nurseId": nid, "name": nurse_name(nurse), "day": day, "shift": shift, "role": nurse.get("role")}
+        item = {
+            "nurseId": nid,
+            "name": nurse_name(nurse),
+            "day": day,
+            "shift": "OFF",
+            "role": nurse.get("role"),
+            "grade": role_group(nurse.get("role")),
+        }
         by_day[day].append(item)
-        by_day_role[(day, nurse.get("role"))].append(item)
+        by_day_grade[(day, item["grade"])].append(item)
 
     blocked = set()
     for day, items in by_day.items():
@@ -148,9 +180,9 @@ def grouped_off_requests(payload: SolveRequest, workers: List[Dict[str, Any]]) -
             conflicts.append({"type": "daily_off_request_limit", "day": day, "limit": 3, "requests": items})
             blocked.update((item["nurseId"], day) for item in items[3:])
 
-    for (day, role), items in by_day_role.items():
+    for (day, grade), items in by_day_grade.items():
         if len(items) > 1:
-            conflicts.append({"type": "same_grade_off_request_conflict", "day": day, "role": role, "requests": items})
+            conflicts.append({"type": "same_grade_off_request_conflict", "day": day, "grade": grade, "requests": items})
             blocked.update((item["nurseId"], day) for item in items[1:])
 
     for items in by_day.values():
@@ -161,46 +193,71 @@ def grouped_off_requests(payload: SolveRequest, workers: List[Dict[str, Any]]) -
     return accepted, conflicts
 
 
-def build_precheck(payload: SolveRequest, workers: List[Dict[str, Any]], num_days: int, off_target: int, min_need: Dict[str, int], max_need: Dict[str, int]) -> List[Dict[str, Any]]:
+def night_targets(worker_count: int, num_days: int, n_required: int) -> Tuple[int, int, int]:
+    total = num_days * n_required
+    return total, floor(total / worker_count), total % worker_count
+
+
+def build_precheck(
+    payload: SolveRequest,
+    workers: List[Dict[str, Any]],
+    num_days: int,
+    target_off: int,
+    min_need: Dict[str, int],
+    max_need: Dict[str, int],
+    request_conflicts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     problems = []
     worker_count = len(workers)
+    if worker_count == 0:
+        return [{"type": "no_workers", "message": "3-shift worker list is empty."}]
+
     total_slots = worker_count * num_days
     required_work_min = num_days * sum(min_need[s] for s in WORK_SHIFTS)
     required_work_max = num_days * sum(max_need[s] for s in WORK_SHIFTS)
-    exact_off_total = worker_count * off_target
-    exact_work_total = total_slots - exact_off_total
-    if exact_work_total < required_work_min:
+    available_work = total_slots - (worker_count * target_off)
+    if available_work < required_work_min:
         problems.append({
-            "type": "too_many_off_slots",
-            "message": "OFF 목표가 너무 많아 최소 필요 인원을 채울 수 없습니다.",
-            "worker_count": worker_count,
-            "off_target": off_target,
+            "type": "too_many_required_off",
+            "message": "Exact OFF target leaves too few work slots for daily minimum staffing.",
+            "available_work": available_work,
             "required_work_min": required_work_min,
-            "available_work": exact_work_total,
-            "relax": ["OFF 목표 개수 감소", "D/E/N 최소 인원 감소", "근무 가능 간호사 추가"],
+            "relax": ["lower OFF target", "lower D/E/N minimum", "add more 3-shift nurses"],
         })
-    if exact_work_total > required_work_max:
+    if available_work > required_work_max:
         problems.append({
-            "type": "too_few_off_slots",
-            "message": "OFF 목표가 너무 적어 최대 인원 범위 안에 모든 근무를 배치할 수 없습니다.",
-            "worker_count": worker_count,
-            "off_target": off_target,
+            "type": "too_few_required_off",
+            "message": "Exact OFF target leaves more work slots than daily maximum staffing allows.",
+            "available_work": available_work,
             "required_work_max": required_work_max,
-            "available_work": exact_work_total,
-            "relax": ["OFF 목표 개수 증가", "D/E 최대 인원 증가"],
+            "relax": ["raise OFF target", "raise D/E maximum staffing"],
         })
-    total_night_min = num_days * NIGHT_MIN
-    total_night_max = num_days * NIGHT_MAX
-    personal_night_min = worker_count * 6
-    personal_night_max = worker_count * 7
-    if personal_night_min > total_night_max or personal_night_max < total_night_min:
-        problems.append({
-            "type": "night_total_mismatch",
-            "message": "일별 N 7~8명 조건과 개인별 N 6~7개 조건이 총량에서 충돌합니다.",
-            "daily_night_total_range": [total_night_min, total_night_max],
-            "personal_night_total_range": [personal_night_min, personal_night_max],
-            "relax": ["개인별 N 범위 조정", "일별 N 인원 조정", "3교대 대상자 수 조정"],
-        })
+
+    grades = Counter(role_group(n.get("role")) for n in workers)
+    if grades["charge"] < 1:
+        problems.append({"type": "charge_shortage", "message": "No charge nurse is available."})
+    if grades["middle"] < 1:
+        problems.append({"type": "middle_shortage", "message": "No middle/acting nurse is available."})
+    if worker_count - grades["junior"] < 2:
+        problems.append({"type": "grade_mix_shortage", "message": "Every shift needs at least one charge and one middle nurse."})
+
+    total_nights, night_floor, night_remainder = night_targets(worker_count, num_days, min_need["N"])
+    if total_nights > worker_count * num_days:
+        problems.append({"type": "night_total_too_high", "total_nights": total_nights})
+    for nurse in workers:
+        allowed = preferred_night_lengths(nurse)
+        possible = any((night_floor if high == 0 else night_floor + 1) % length == 0 or length != 3 for high in (0, 1) for length in allowed)
+        if nurse_name(nurse) == LEE_HYEMI and not possible:
+            problems.append({
+                "type": "hye_mi_night_block_impossible",
+                "message": "Lee Hye-mi must receive only 3-night blocks, but floor/ceil night target is incompatible.",
+                "night_floor": night_floor,
+                "night_remainder": night_remainder,
+            })
+            break
+
+    if request_conflicts:
+        problems.append({"type": "off_request_conflicts", "message": "Some OFF requests conflict and will not be confirmed.", "conflicts": request_conflicts})
     return problems
 
 
@@ -210,22 +267,14 @@ def solve(payload: SolveRequest) -> Dict[str, Any]:
     num_days = days_in_month(year, month)
     nurses = payload.nurses
     workers = worker_nurses(nurses)
-    off_target = int(payload.offTarget if payload.offTarget is not None else payload.baseOff if payload.baseOff is not None else 10)
-    min_need = {
-        "D": max(1, int(payload.needs.get("D") or 8)),
-        "E": max(1, int(payload.needs.get("E") or 8)),
-        "N": NIGHT_MIN,
-    }
-    max_need = {
-        "D": max(min_need["D"], int(payload.maxNeeds.get("D") or 10)),
-        "E": max(min_need["E"], int(payload.maxNeeds.get("E") or 10)),
-        "N": NIGHT_MAX,
-    }
-
+    target_off = off_target(payload)
+    min_need, max_need = daily_needs(payload)
     request_off, request_conflicts = grouped_off_requests(payload, workers)
-    precheck = build_precheck(payload, workers, num_days, off_target, min_need, max_need)
-    if precheck:
-        return failure_response("precheck_failed", "입력 조건의 총량이 충돌해 해를 만들 수 없습니다.", precheck, request_conflicts, payload, None)
+    precheck = build_precheck(payload, workers, num_days, target_off, min_need, max_need, request_conflicts)
+    # OFF request conflicts are returned, but non-blocking; all other precheck issues are hard.
+    blocking_precheck = [p for p in precheck if p.get("type") != "off_request_conflicts"]
+    if blocking_precheck:
+        return failure_response("precheck_failed", "Input conditions are infeasible before solving.", blocking_precheck, precheck, payload, None)
 
     model = cp_model.CpModel()
     x: Dict[Tuple[str, int, str], cp_model.IntVar] = {}
@@ -253,19 +302,36 @@ def solve(payload: SolveRequest) -> Dict[str, Any]:
             model.Add(sum(assigned) >= min_need[shift])
             model.Add(sum(assigned) <= max_need[shift])
 
+            charge = sum(x[(n["id"], day, shift)] for n in workers if role_group(n.get("role")) == "charge")
+            middle = sum(x[(n["id"], day, shift)] for n in workers if role_group(n.get("role")) == "middle")
+            junior = sum(x[(n["id"], day, shift)] for n in workers if role_group(n.get("role")) == "junior")
+            model.Add(charge >= 1)
+            model.Add(middle >= 1)
+            model.Add(junior <= 4)
+
+    total_required_nights, night_floor, night_remainder = night_targets(len(workers), num_days, min_need["N"])
+    high_night: Dict[str, cp_model.IntVar] = {}
+    model.Add(sum(x[(n["id"], day, "N")] for n in workers for day in range(1, num_days + 1)) == total_required_nights)
     for nurse in workers:
         nid = nurse["id"]
-        for day in range(1, num_days):
-            model.Add(x[(nid, day, "E")] + x[(nid, day + 1, "D")] <= 1)
-        for start in range(1, num_days - 5 + 2):
-            model.Add(sum(work[(nid, day)] for day in range(start, start + 5)) <= 4)
-        model.Add(sum(x[(nid, day, "OFF")] for day in range(1, num_days + 1)) == off_target)
+        high_night[nid] = model.NewBoolVar(f"night_high_{nid}")
+    model.Add(sum(high_night.values()) == night_remainder)
 
     for nurse in workers:
         nid = nurse["id"]
-        previous_run = previous_night_run_at_end(payload.previousSchedule, nid)
+        row_nights = [x[(nid, day, "N")] for day in range(1, num_days + 1)]
+        model.Add(sum(row_nights) == night_floor + high_night[nid])
+        model.Add(sum(x[(nid, day, "OFF")] for day in range(1, num_days + 1)) == target_off)
+
+        for day in range(1, num_days):
+            model.Add(x[(nid, day, "E")] + x[(nid, day + 1, "D")] <= 1)
+            model.Add(x[(nid, day, "N")] + x[(nid, day + 1, "D")] <= 1)
+            model.Add(x[(nid, day, "N")] + x[(nid, day + 1, "E")] <= 1)
+        for start in range(1, num_days - 5 + 2):
+            model.Add(sum(work[(nid, day)] for day in range(start, start + 5)) <= 4)
+
         carried_nights = {day for day, shift in carry[nid].items() if shift == "N"}
-        generated_cover = {day: [] for day in range(1, num_days + 1)}
+        generated_cover: Dict[int, List[cp_model.IntVar]] = {day: [] for day in range(1, num_days + 1)}
         for length in preferred_night_lengths(nurse):
             for start in range(1, num_days - length + 2):
                 if any(day in carried_nights for day in range(start, start + length)):
@@ -287,72 +353,21 @@ def solve(payload: SolveRequest) -> Dict[str, Any]:
             else:
                 model.Add(x[(nid, day, "N")] == 0)
 
-        total_nights = previous_run + sum(x[(nid, day, "N")] for day in range(1, num_days + 1))
-        model.Add(total_nights >= 6)
-        model.Add(total_nights <= 7)
-
-    penalties = []
-    for day in range(1, num_days + 1):
-        for shift in WORK_SHIFTS:
-            role_counts = {
-                role: sum(x[(n["id"], day, shift)] for n in workers if n.get("role") == role)
-                for role in WORK_ROLES
-            }
-            charge_short = model.NewIntVar(0, 1, f"charge_short_{day}_{shift}")
-            model.Add(charge_short >= 1 - role_counts["charge"])
-            penalties.append(charge_short * 400)
-            charge_over = model.NewIntVar(0, 6, f"charge_over_{day}_{shift}")
-            model.Add(charge_over >= role_counts["charge"] - 1)
-            penalties.append(charge_over * 80)
-            mid_diff = model.NewIntVar(0, 20, f"mid_diff_{day}_{shift}")
-            new_diff = model.NewIntVar(0, 20, f"new_diff_{day}_{shift}")
-            model.AddAbsEquality(mid_diff, role_counts["mid"] - 3)
-            model.AddAbsEquality(new_diff, role_counts["newn"] - 3)
-            penalties.extend([mid_diff * 8, new_diff * 8])
-            new_over = model.NewIntVar(0, 20, f"new_over_{day}_{shift}")
-            model.Add(new_over >= role_counts["newn"] - 4)
-            penalties.append(new_over * 30)
-
-    for nurse in workers:
-        nid = nurse["id"]
-        d_count = sum(x[(nid, day, "D")] for day in range(1, num_days + 1))
-        e_count = sum(x[(nid, day, "E")] for day in range(1, num_days + 1))
-        de_diff = model.NewIntVar(0, num_days, f"de_diff_{nid}")
-        model.AddAbsEquality(de_diff, d_count - e_count)
-        penalties.append(de_diff * 3)
-        for day in range(1, num_days - 2 + 1):
-            scattered = model.NewBoolVar(f"work_off_work_{nid}_{day}")
-            model.Add(work[(nid, day)] + x[(nid, day + 1, "OFF")] + work[(nid, day + 2)] == 3).OnlyEnforceIf(scattered)
-            model.Add(work[(nid, day)] + x[(nid, day + 1, "OFF")] + work[(nid, day + 2)] <= 2).OnlyEnforceIf(scattered.Not())
-            penalties.append(scattered * 7)
-
-    # Prefer 2-night blocks unless the model needs 3-night blocks.
-    for (nid, start, length), var in blocks.items():
-        if length == 3:
-            penalties.append(var * 12)
-
-    model.Minimize(sum(penalties) if penalties else 0)
+    # Phase 1 is satisfaction only: a schedule that breaks no hard rule is more
+    # important than a prettier but slow-to-prove objective.
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = max(DEFAULT_TIME_LIMIT_SECONDS, min(180, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS)))
+    solver.parameters.max_time_in_seconds = max(DEFAULT_TIME_LIMIT_SECONDS, min(240, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS)))
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
-
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return failure_response(
-            "solver_infeasible",
-            "OR-Tools가 모든 필수조건을 만족하는 근무표를 찾지 못했습니다.",
-            explain_infeasible(payload, workers, num_days, off_target, min_need, max_need, request_conflicts),
-            request_conflicts,
-            payload,
-            None,
-            solver.StatusName(status),
-        )
+        reasons = explain_infeasible(payload, workers, num_days, target_off, min_need, max_need, precheck)
+        return failure_response("solver_infeasible", "OR-Tools could not find a schedule satisfying all hard constraints.", reasons, precheck, payload, None, solver.StatusName(status))
 
     schedule: Dict[str, List[str]] = {}
     for nurse in nurses:
         nid = nurse["id"]
-        if nurse.get("role") not in WORK_ROLES:
+        if role_group(nurse.get("role")) not in WORK_GROUPS:
             schedule[nid] = fixed_schedule_for(nurse, year, month, num_days)
             continue
         row = []
@@ -365,102 +380,158 @@ def solve(payload: SolveRequest) -> Dict[str, Any]:
             row.append(value)
         schedule[nid] = row
 
-    validation = validate_schedule(payload, schedule, request_conflicts)
+    validation = validate_schedule(payload, schedule, precheck)
     if validation["hard_violations"]:
-        return failure_response(
-            "validation_failed",
-            "생성 후 검증에서 필수조건 위반이 발견되어 근무표를 반환하지 않습니다.",
-            validation["hard_violations"],
-            request_conflicts,
-            payload,
-            validation,
-            solver.StatusName(status),
-        )
+        return failure_response("validation_failed", "Generated schedule failed hard validation and will not be returned as successful.", validation["hard_violations"], precheck, payload, validation, solver.StatusName(status))
 
-    return {
-        "ok": True,
-        "status": solver.StatusName(status),
-        "schedule": schedule,
-        "score": int(solver.ObjectiveValue()),
-        "objective": solver.ObjectiveValue(),
-        "validation": validation,
-        "hard_violations": [],
-        "warnings": validation["warnings"],
-        "unmet_requests": validation["unmet_requests"],
-        "staffing_summary": validation["staffing_summary"],
-        "grade_summary": validation["grade_summary"],
-        "individual_shift_counts": validation["individual_shift_counts"],
-    }
+    return success_response(schedule, validation, schedule_score(validation), solver.StatusName(status))
 
 
-def explain_infeasible(payload: SolveRequest, workers: List[Dict[str, Any]], num_days: int, off_target: int, min_need: Dict[str, int], max_need: Dict[str, int], request_conflicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    reasons = build_precheck(payload, workers, num_days, off_target, min_need, max_need)
-    if request_conflicts:
-        reasons.append({"type": "off_request_conflicts", "message": "OFF 신청 충돌이 있습니다.", "conflicts": request_conflicts})
-    reasons.append({
-        "type": "generic_relaxation_suggestions",
-        "message": "총량 조건이 맞아도 연속 N/OFF/연속근무/요청 OFF가 조합상 충돌할 수 있습니다.",
-        "relax": ["OFF 목표 정확 일치 완화", "개인별 N 6~7개 완화", "일별 N 7~8명 완화", "요청 OFF 일부 미반영 허용"],
-    })
+def explain_infeasible(
+    payload: SolveRequest,
+    workers: List[Dict[str, Any]],
+    num_days: int,
+    target_off: int,
+    min_need: Dict[str, int],
+    max_need: Dict[str, int],
+    precheck: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    reasons = [p for p in precheck if p.get("type") != "off_request_conflicts"]
+    if not reasons:
+        total_nights, night_floor, night_remainder = night_targets(len(workers), num_days, min_need["N"])
+        reasons.append({
+            "type": "constraint_combination_conflict",
+            "message": "The exact OFF count, daily staffing, grade mix, night block, and recovery rules conflict.",
+            "night_total": total_nights,
+            "night_floor": night_floor,
+            "night_remainder": night_remainder,
+            "off_target": target_off,
+            "daily_min": min_need,
+            "daily_max": max_need,
+            "relax": ["lower exact OFF target", "allow one more D/E maximum", "add charge or middle nurse", "reduce OFF requests"],
+        })
     return reasons
 
 
-def failure_response(kind: str, message: str, hard_violations: Any, request_conflicts: List[Dict[str, Any]], payload: SolveRequest, validation: Dict[str, Any] | None, status: str | None = None) -> Dict[str, Any]:
+def success_response(schedule: Dict[str, List[str]], validation: Dict[str, Any], score: int, status: str) -> Dict[str, Any]:
     return {
+        "success": True,
+        "ok": True,
+        "status": status,
+        "schedule": schedule,
+        "score": score,
+        "objective": score,
+        "validation": validation,
+        "hard_violations": [],
+        "warnings": validation["warnings"],
+        "infeasible_reasons": [],
+        "unmet_requests": validation["unmet_requests"],
+        "daily_staffing_summary": validation["daily_staffing_summary"],
+        "staffing_summary": validation["daily_staffing_summary"],
+        "grade_summary": validation["grade_summary"],
+        "individual_shift_counts": validation["individual_shift_counts"],
+        "off_summary": validation["off_summary"],
+        "night_distribution": validation["night_distribution"],
+    }
+
+
+def schedule_score(validation: Dict[str, Any]) -> int:
+    if validation.get("hard_violations"):
+        return 0
+    score = 100000
+    score -= len(validation.get("warnings", [])) * 100
+    for item in validation.get("individual_shift_counts", []):
+        score -= abs(int(item.get("D", 0)) - int(item.get("E", 0))) * 12
+    for item in validation.get("grade_summary", []):
+        score -= abs(int(item.get("charge_count", 0)) - 1) * 8
+        score -= abs(int(item.get("middle_count", 0)) - 3) * 3
+        score -= abs(int(item.get("junior_count", 0)) - 3) * 3
+    return max(0, int(score))
+
+
+def failure_response(
+    kind: str,
+    message: str,
+    hard_violations: Any,
+    precheck: List[Dict[str, Any]],
+    payload: SolveRequest,
+    validation: Dict[str, Any] | None,
+    status: str | None = None,
+) -> Dict[str, Any]:
+    hard_list = hard_violations if isinstance(hard_violations, list) else [hard_violations]
+    return {
+        "success": False,
         "ok": False,
         "status": status,
         "error": message,
         "reason": kind,
         "schedule": None,
-        "hard_violations": hard_violations if isinstance(hard_violations, list) else [hard_violations],
+        "hard_violations": hard_list,
         "warnings": [] if validation is None else validation.get("warnings", []),
+        "infeasible_reasons": hard_list,
         "unmet_requests": [] if validation is None else validation.get("unmet_requests", []),
-        "request_conflicts": request_conflicts,
-        "staffing_summary": [] if validation is None else validation.get("staffing_summary", []),
+        "request_conflicts": [p for p in precheck if p.get("type") == "off_request_conflicts"],
+        "daily_staffing_summary": [] if validation is None else validation.get("daily_staffing_summary", []),
+        "staffing_summary": [] if validation is None else validation.get("daily_staffing_summary", []),
         "grade_summary": [] if validation is None else validation.get("grade_summary", []),
         "individual_shift_counts": [] if validation is None else validation.get("individual_shift_counts", []),
-        "input_relaxation_suggestions": hard_violations,
+        "off_summary": [] if validation is None else validation.get("off_summary", []),
+        "night_distribution": [] if validation is None else validation.get("night_distribution", []),
         "input_summary": {
             "year": payload.year,
             "month": payload.month,
             "worker_count": len(worker_nurses(payload.nurses)),
-            "offTarget": payload.offTarget if payload.offTarget is not None else payload.baseOff,
+            "offTarget": off_target(payload),
             "needs": payload.needs,
             "maxNeeds": payload.maxNeeds,
         },
     }
 
 
-def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], request_conflicts: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
-    year = payload.year
-    month = payload.month
-    num_days = days_in_month(year, month)
-    nurses = payload.nurses
-    workers = worker_nurses(nurses)
+def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], precheck: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    num_days = days_in_month(payload.year, payload.month)
+    workers = worker_nurses(payload.nurses)
     by_id = {n["id"]: n for n in workers}
-    off_target = int(payload.offTarget if payload.offTarget is not None else payload.baseOff if payload.baseOff is not None else 10)
-    min_need = {"D": max(1, int(payload.needs.get("D") or 8)), "E": max(1, int(payload.needs.get("E") or 8)), "N": NIGHT_MIN}
-    max_need = {"D": max(min_need["D"], int(payload.maxNeeds.get("D") or 10)), "E": max(min_need["E"], int(payload.maxNeeds.get("E") or 10)), "N": NIGHT_MAX}
+    target_off = off_target(payload)
+    min_need, max_need = daily_needs(payload)
+    total_required_nights, night_floor, night_remainder = night_targets(len(workers), num_days, min_need["N"])
     hard: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
-    staffing_summary: List[Dict[str, Any]] = []
+    unmet_requests: List[Dict[str, Any]] = []
+    daily_staffing: List[Dict[str, Any]] = []
     grade_summary: List[Dict[str, Any]] = []
     individual: List[Dict[str, Any]] = []
-    unmet_requests: List[Dict[str, Any]] = []
+    off_summary: List[Dict[str, Any]] = []
+    night_distribution: List[Dict[str, Any]] = []
+
+    for item in precheck or []:
+        if item.get("type") == "off_request_conflicts":
+            warnings.append(item)
 
     for nurse in workers:
         nid = nurse["id"]
-        row = schedule.get(nid, [])
+        row = (schedule.get(nid, []) + [""] * num_days)[:num_days]
         counts = Counter(row)
-        individual.append({"nurseId": nid, "name": nurse_name(nurse), "role": nurse.get("role"), "D": counts["D"], "E": counts["E"], "N": counts["N"], "OFF": counts["OFF"]})
-        for idx, value in enumerate(row, start=1):
+        individual.append({"nurseId": nid, "name": nurse_name(nurse), "role": nurse.get("role"), "grade": role_group(nurse.get("role")), "D": counts["D"], "E": counts["E"], "N": counts["N"], "OFF": counts["OFF"]})
+        off_summary.append({"nurseId": nid, "name": nurse_name(nurse), "required_off": target_off, "actual_off": counts["OFF"], "off_difference": counts["OFF"] - target_off})
+        for value in (night_floor, night_floor + 1):
+            if counts["N"] == value:
+                break
+        else:
+            hard.append({"type": "night_distribution_mismatch", "nurseId": nid, "name": nurse_name(nurse), "night": counts["N"], "allowed": [night_floor, night_floor + 1]})
+        night_distribution.append({"nurseId": nid, "name": nurse_name(nurse), "night_count": counts["N"], "allowed_floor": night_floor, "allowed_ceil": night_floor + 1})
+
+        for day, value in enumerate(row, start=1):
             if value not in SHIFTS:
-                hard.append({"type": "invalid_shift", "nurseId": nid, "name": nurse_name(nurse), "day": idx, "value": value})
-        if counts["OFF"] != off_target:
-            hard.append({"type": "off_target_mismatch", "nurseId": nid, "name": nurse_name(nurse), "off": counts["OFF"], "target": off_target})
+                hard.append({"type": "invalid_shift", "nurseId": nid, "name": nurse_name(nurse), "day": day, "value": value})
+        if counts["OFF"] != target_off:
+            hard.append({"type": "off_target_mismatch", "nurseId": nid, "name": nurse_name(nurse), "actual": counts["OFF"], "required": target_off, "diff": counts["OFF"] - target_off})
         for day in range(1, num_days):
             if row[day - 1] == "E" and row[day] == "D":
                 hard.append({"type": "evening_to_day", "nurseId": nid, "name": nurse_name(nurse), "fromDay": day, "toDay": day + 1})
+            if row[day - 1] == "N" and row[day] in {"D", "E"}:
+                hard.append({"type": "night_next_day_work", "nurseId": nid, "name": nurse_name(nurse), "fromDay": day, "toDay": day + 1, "actual": row[day]})
+
         previous_run = previous_night_run_at_end(payload.previousSchedule, nid)
         day = 1
         while day <= num_days:
@@ -479,73 +550,81 @@ def validate_schedule(payload: SolveRequest, schedule: Dict[str, List[str]], req
                 hard.append({"type": "single_night", "nurseId": nid, "name": nurse_name(nurse), "day": start})
             if total_length >= 4:
                 hard.append({"type": "night_run_too_long", "nurseId": nid, "name": nurse_name(nurse), "startDay": start, "length": total_length})
-            for off_day in range(day, min(num_days, day + 1) + 1):
-                if row[off_day - 1] != "OFF":
-                    hard.append({"type": "night_recovery_off_missing", "nurseId": nid, "name": nurse_name(nurse), "nightStartDay": start, "day": off_day, "actual": row[off_day - 1]})
-            if day <= num_days and row[day - 1] in {"D", "E"}:
-                hard.append({"type": "night_next_day_work", "nurseId": nid, "name": nurse_name(nurse), "day": day, "actual": row[day - 1]})
-        if counts["N"] and (counts["N"] < 6 or counts["N"] > 7):
-            hard.append({"type": "night_count_out_of_range", "nurseId": nid, "name": nurse_name(nurse), "night": counts["N"], "range": [6, 7]})
+            if day <= num_days:
+                for off_day in range(day, min(num_days, day + 1) + 1):
+                    if row[off_day - 1] != "OFF":
+                        hard.append({"type": "night_recovery_off_missing", "nurseId": nid, "name": nurse_name(nurse), "nightStartDay": start, "day": off_day, "actual": row[off_day - 1]})
+            else:
+                warnings.append({"type": "boundary_warning", "nurseId": nid, "name": nurse_name(nurse), "message": "Night block ends at month boundary; next-month recovery OFF must be checked."})
 
-    night_counts = [item["N"] for item in individual]
-    if night_counts and max(night_counts) - min(night_counts) > max(1, int(payload.nightTolerance or 1)):
-        hard.append({"type": "night_count_variance", "min": min(night_counts), "max": max(night_counts), "allowedDifference": max(1, int(payload.nightTolerance or 1))})
+    high_count = sum(1 for item in night_distribution if item["night_count"] == night_floor + 1)
+    total_nights = sum(item["night_count"] for item in night_distribution)
+    if total_nights != total_required_nights:
+        hard.append({"type": "night_total_mismatch", "actual": total_nights, "required": total_required_nights})
+    if high_count != night_remainder:
+        hard.append({"type": "night_remainder_mismatch", "actual_high_count": high_count, "required_high_count": night_remainder})
 
     for day in range(1, num_days + 1):
         for shift in WORK_SHIFTS:
             assigned = [n for n in workers if (schedule.get(n["id"], []) + [""] * num_days)[day - 1] == shift]
-            role_counts = Counter(n.get("role") for n in assigned)
-            item = {"day": day, "shift": shift, "count": len(assigned), "min": min_need[shift], "max": max_need[shift]}
-            staffing_summary.append(item)
-            grade_summary.append({"day": day, "shift": shift, "charge": role_counts["charge"], "mid": role_counts["mid"], "newn": role_counts["newn"]})
+            grades = Counter(role_group(n.get("role")) for n in assigned)
+            staffing = {"day": day, "shift": shift, "count": len(assigned), "min": min_need[shift], "max": max_need[shift]}
+            daily_staffing.append(staffing)
+            grade_item = {
+                "day": day,
+                "shift": shift,
+                "charge_count": grades["charge"],
+                "middle_count": grades["middle"],
+                "junior_count": grades["junior"],
+                "grade_violation": False,
+            }
             if len(assigned) < min_need[shift]:
-                hard.append({"type": "staffing_under_minimum", **item})
+                hard.append({"type": "staffing_under_minimum", **staffing})
             if len(assigned) > max_need[shift]:
-                hard.append({"type": "staffing_over_maximum", **item})
-            if len(assigned) > 0 and role_counts["charge"] == 0:
-                warnings.append({"type": "no_charge_on_shift", "day": day, "shift": shift})
-            if role_counts["newn"] > 4:
-                warnings.append({"type": "too_many_newn", "day": day, "shift": shift, "newn": role_counts["newn"]})
+                hard.append({"type": "staffing_over_maximum", **staffing})
+            if grades["charge"] < 1:
+                grade_item["grade_violation"] = True
+                hard.append({"type": "no_charge_on_shift", "day": day, "shift": shift, **grade_item})
+            if grades["middle"] < 1:
+                grade_item["grade_violation"] = True
+                hard.append({"type": "no_middle_on_shift", "day": day, "shift": shift, **grade_item})
+            if grades["junior"] >= 5:
+                grade_item["grade_violation"] = True
+                hard.append({"type": "too_many_junior_on_shift", "day": day, "shift": shift, **grade_item})
+            grade_summary.append(grade_item)
 
     request_off, conflicts = grouped_off_requests(payload, workers)
-    for (nid, day), shift in request_off.items():
-        if (schedule.get(nid, []) + [""] * num_days)[day - 1] != shift:
-            nurse = by_id.get(nid, {"name": nid, "role": ""})
-            unmet_requests.append({"nurseId": nid, "name": nurse_name(nurse), "role": nurse.get("role"), "day": day, "requested": shift, "actual": schedule.get(nid, [None] * num_days)[day - 1]})
-    if unmet_requests:
-        hard.extend({"type": "requested_off_unmet", **item} for item in unmet_requests)
     for conflict in conflicts:
         warnings.append(conflict)
-
-    same_grade_conflicts = []
-    for day in range(1, num_days + 1):
-        role_off = defaultdict(list)
-        for nurse in workers:
-            if (schedule.get(nurse["id"], []) + [""] * num_days)[day - 1] == "OFF" and request_off.get((nurse["id"], day)) == "OFF":
-                role_off[nurse.get("role")].append({"nurseId": nurse["id"], "name": nurse_name(nurse)})
-        for role, items in role_off.items():
-            if len(items) > 1:
-                same_grade_conflicts.append({"type": "same_grade_requested_off_overlap", "day": day, "role": role, "requests": items})
-    warnings.extend(same_grade_conflicts)
+    for (nid, day), shift in request_off.items():
+        actual = (schedule.get(nid, []) + [""] * num_days)[day - 1]
+        if actual != shift:
+            nurse = by_id.get(nid, {"name": nid, "role": ""})
+            item = {"nurseId": nid, "name": nurse_name(nurse), "role": nurse.get("role"), "day": day, "requested": shift, "actual": actual}
+            unmet_requests.append(item)
+            hard.append({"type": "requested_off_unmet", **item})
 
     return {
         "hard_violations": hard,
         "warnings": warnings,
         "unmet_requests": unmet_requests,
-        "staffing_summary": staffing_summary,
+        "daily_staffing_summary": daily_staffing,
+        "staffing_summary": daily_staffing,
         "grade_summary": grade_summary,
         "individual_shift_counts": individual,
+        "off_summary": off_summary,
+        "night_distribution": night_distribution,
     }
 
 
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {"ok": True, "service": "nurse-autoschedule", "engine": "OR-Tools CP-SAT"}
+    return {"ok": True, "success": True, "service": "nurse-autoschedule", "engine": "OR-Tools CP-SAT"}
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True}
+    return {"ok": True, "success": True}
 
 
 @app.post("/solve")
