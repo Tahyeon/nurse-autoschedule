@@ -131,6 +131,28 @@ def required_off(payload: SolveRequest) -> int:
     return max(0, int(next(value for value in values if value is not None)))
 
 
+def balanced_staffing_targets(
+    worker_count: int,
+    num_days: int,
+    exact_off: int,
+    minimum: dict[str, int],
+    maximum: dict[str, int],
+) -> list[dict[str, int]]:
+    targets = [{shift: minimum[shift] for shift in WORK_SHIFTS} for _ in range(num_days)]
+    remaining = worker_count * (num_days - exact_off) - num_days * sum(minimum.values())
+    for shift in WORK_SHIFTS:
+        while remaining > 0 and any(day[shift] < maximum[shift] for day in targets):
+            for day in targets:
+                if remaining <= 0:
+                    break
+                if day[shift] < maximum[shift]:
+                    day[shift] += 1
+                    remaining -= 1
+    if remaining:
+        raise ValueError("Daily maximum staffing cannot absorb all required work slots.")
+    return targets
+
+
 def previous_boundary(
     payload: SolveRequest,
     nurse: dict[str, Any],
@@ -157,6 +179,101 @@ def previous_boundary(
         for day in range(continuation + 1, min(num_days, continuation + 2) + 1):
             fixed[day] = "OFF"
     return fixed, previous_ends_evening, trailing_nights
+
+
+def solve_night_plan(
+    payload: SolveRequest,
+    workers: list[dict[str, Any]],
+    num_days: int,
+    daily_targets: list[dict[str, int]],
+    off_requests: set[tuple[str, int]],
+) -> tuple[dict[str, list[int]], str]:
+    model = cp_model.CpModel()
+    night: dict[tuple[str, int], cp_model.IntVar] = {}
+    blocks: dict[tuple[str, int, int], cp_model.IntVar] = {}
+    boundaries = {
+        str(nurse["id"]): previous_boundary(payload, nurse, num_days)
+        for nurse in workers
+    }
+
+    for nurse in workers:
+        nurse_id = str(nurse["id"])
+        for day in range(1, num_days + 1):
+            night[nurse_id, day] = model.NewBoolVar(f"night_{nurse_id}_{day}")
+            if (nurse_id, day) in off_requests or boundaries[nurse_id][0].get(day) == "OFF":
+                model.Add(night[nurse_id, day] == 0)
+
+        coverage: dict[int, list[cp_model.IntVar]] = defaultdict(list)
+        employee_blocks: list[cp_model.IntVar] = []
+        fixed_days = set(boundaries[nurse_id][0])
+        lengths = (3,) if nurse_name(nurse) == LEE_HYEMI else (2, 3)
+        for length in lengths:
+            for start in range(1, num_days - length + 2):
+                if fixed_days.intersection(range(start, start + length)):
+                    continue
+                block = model.NewBoolVar(f"night_block_{nurse_id}_{start}_{length}")
+                blocks[nurse_id, start, length] = block
+                employee_blocks.append(block)
+                for day in range(start, start + length):
+                    coverage[day].append(block)
+                for recovery_day in (start + length, start + length + 1):
+                    if recovery_day <= num_days:
+                        model.Add(night[nurse_id, recovery_day] == 0).OnlyEnforceIf(block)
+
+        for day in range(1, num_days + 1):
+            if boundaries[nurse_id][0].get(day) == "N":
+                model.Add(night[nurse_id, day] == 1)
+                model.Add(sum(coverage.get(day, [])) == 0)
+            else:
+                model.Add(night[nurse_id, day] == sum(coverage.get(day, [])))
+
+        if nurse_name(nurse) == LEE_HYEMI:
+            carried = 1 if boundaries[nurse_id][2] else 0
+            model.Add(sum(employee_blocks) == 2 - carried)
+
+    for day in range(1, num_days + 1):
+        model.Add(sum(night[str(n["id"]), day] for n in workers) == daily_targets[day - 1]["N"])
+        for grade in ("charge", "middle"):
+            model.Add(sum(
+                night[str(n["id"]), day]
+                for n in workers if role_group(n.get("role")) == grade
+            ) >= 1)
+
+    general_workers = sorted(
+        [nurse for nurse in workers if nurse_name(nurse) != LEE_HYEMI],
+        key=lambda nurse: (
+            {"junior": 0, "middle": 1, "charge": 2}.get(role_group(nurse.get("role")), 3),
+            str(nurse["id"]),
+        ),
+    )
+    hye_mi = next((nurse for nurse in workers if nurse_name(nurse) == LEE_HYEMI), None)
+    hye_total = 0
+    if hye_mi:
+        hye_id = str(hye_mi["id"])
+        carried = 1 if boundaries[hye_id][2] else 0
+        continuation = sum(1 for value in boundaries[hye_id][0].values() if value == "N")
+        hye_total = continuation + (2 - carried) * 3
+    general_required = sum(day["N"] for day in daily_targets) - hye_total
+    if general_workers:
+        floor_target, high_count = divmod(general_required, len(general_workers))
+        for index, nurse in enumerate(general_workers):
+            nurse_id = str(nurse["id"])
+            target = floor_target + (1 if index < high_count else 0)
+            model.Add(sum(night[nurse_id, day] for day in range(1, num_days + 1)) == target)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = min(60, max(20, payload.timeLimitSeconds // 2))
+    solver.parameters.num_search_workers = 8
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return {}, solver.StatusName(status)
+    return {
+        str(nurse["id"]): [
+            int(solver.BooleanValue(night[str(nurse["id"]), day]))
+            for day in range(1, num_days + 1)
+        ]
+        for nurse in workers
+    }, solver.StatusName(status)
 
 
 def infeasible_response(message: str, reasons: list[dict[str, Any]], status: str = "INFEASIBLE") -> dict[str, Any]:
@@ -235,6 +352,16 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     worker_ids = {str(n["id"]) for n in workers}
     minimum, maximum = staffing_limits(payload)
     minimum_off = required_off(payload)
+    try:
+        daily_targets = balanced_staffing_targets(
+            len(workers), num_days, minimum_off, minimum, maximum
+        )
+    except ValueError as error:
+        return infeasible_response(
+            "현재 인원·OFF·최소인원·최대인원 조건을 동시에 만족할 수 없습니다.",
+            [{"type": "staffing_capacity", "message": str(error)}],
+            "PRECHECK_FAILED",
+        )
     off_requests, request_conflicts = requested_off(payload, worker_ids, num_days)
     precheck_hard, precheck_warnings = precheck(
         payload, workers, num_days, minimum, maximum, minimum_off, request_conflicts
@@ -244,6 +371,15 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             "현재 인원·OFF·최소인원·Grade 조건을 동시에 만족할 수 없습니다.",
             precheck_hard,
             "PRECHECK_FAILED",
+        )
+    night_plan, night_status = solve_night_plan(
+        payload, workers, num_days, daily_targets, off_requests
+    )
+    if not night_plan:
+        return infeasible_response(
+            "Night 인원·연속 블록·Grade 조건을 동시에 만족할 수 없습니다.",
+            [{"type": "night_plan_infeasible", "solver_status": night_status}],
+            night_status,
         )
 
     model = cp_model.CpModel()
@@ -260,6 +396,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             for shift in SHIFTS:
                 x[nurse_id, day, shift] = model.NewBoolVar(f"x_{nurse_id}_{day}_{shift}")
             model.AddExactlyOne(x[nurse_id, day, shift] for shift in SHIFTS)
+            model.Add(x[nurse_id, day, "N"] == night_plan[nurse_id][day - 1])
             fixed_shift = boundaries[nurse_id][0].get(day)
             if fixed_shift:
                 model.Add(x[nurse_id, day, fixed_shift] == 1)
@@ -271,8 +408,11 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     for day in range(1, num_days + 1):
         for shift in WORK_SHIFTS:
             assigned = [x[str(n["id"]), day, shift] for n in workers]
-            model.Add(sum(assigned) >= minimum[shift])
-            model.Add(sum(assigned) <= maximum[shift])
+            if shift == "N":
+                model.Add(sum(assigned) == daily_targets[day - 1][shift])
+            else:
+                model.Add(sum(assigned) >= minimum[shift])
+                model.Add(sum(assigned) <= maximum[shift])
             model.Add(sum(
                 x[str(n["id"]), day, shift]
                 for n in workers if role_group(n.get("role")) == "charge"
