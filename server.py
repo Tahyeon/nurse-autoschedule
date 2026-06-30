@@ -435,29 +435,54 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             model.Add(x[nurse_id, day, "N"] + x[nurse_id, day + 1, "D"] <= 1)
             model.Add(x[nurse_id, day, "N"] + x[nurse_id, day + 1, "E"] <= 1)
 
-        # Keep D/E in practical 2-5 day runs instead of isolated workdays.
+        # Prefer practical D/E runs without making them hard constraints.
         for shift in ("D", "E"):
-            for start in range(1, num_days - 4):
-                model.Add(
-                    sum(x[nurse_id, day, shift] for day in range(start, start + 6)) <= 5
-                )
-            model.Add(x[nurse_id, 1, shift] <= x[nurse_id, 2, shift])
-            for day in range(2, num_days):
-                model.Add(
-                    x[nurse_id, day, shift]
-                    <= x[nurse_id, day - 1, shift] + x[nurse_id, day + 1, shift]
-                )
-            model.Add(x[nurse_id, num_days, shift] <= x[nurse_id, num_days - 1, shift])
+            first_single = model.NewBoolVar(f"single_{shift}_{nurse_id}_1")
+            model.Add(first_single <= x[nurse_id, 1, shift])
+            model.Add(first_single + x[nurse_id, 2, shift] <= 1)
+            model.Add(first_single >= x[nurse_id, 1, shift] - x[nurse_id, 2, shift])
+            objective_terms.append(first_single * 30)
 
-        # Any uninterrupted combination of D/E/N is limited to five days.
-        for start in range(1, num_days - 4):
+            for day in range(2, num_days):
+                single = model.NewBoolVar(f"single_{shift}_{nurse_id}_{day}")
+                model.Add(single <= x[nurse_id, day, shift])
+                model.Add(single + x[nurse_id, day - 1, shift] <= 1)
+                model.Add(single + x[nurse_id, day + 1, shift] <= 1)
+                model.Add(
+                    single
+                    >= x[nurse_id, day, shift]
+                    - x[nurse_id, day - 1, shift]
+                    - x[nurse_id, day + 1, shift]
+                )
+                objective_terms.append(single * 30)
+
+            last_single = model.NewBoolVar(f"single_{shift}_{nurse_id}_{num_days}")
+            model.Add(last_single <= x[nurse_id, num_days, shift])
+            model.Add(last_single + x[nurse_id, num_days - 1, shift] <= 1)
             model.Add(
-                sum(
-                    x[nurse_id, day, shift]
-                    for day in range(start, start + 6)
-                    for shift in WORK_SHIFTS
-                ) <= 5
+                last_single
+                >= x[nurse_id, num_days, shift] - x[nurse_id, num_days - 1, shift]
             )
+            objective_terms.append(last_single * 30)
+
+            for start in range(1, num_days - 4):
+                six_same = model.NewBoolVar(f"six_{shift}_{nurse_id}_{start}")
+                six_total = sum(
+                    x[nurse_id, day, shift] for day in range(start, start + 6)
+                )
+                model.Add(six_total == 6).OnlyEnforceIf(six_same)
+                model.Add(six_total <= 5).OnlyEnforceIf(six_same.Not())
+                objective_terms.append(six_same * 20)
+
+        # Prefer an OFF before a sixth consecutive D/E/N workday.
+        for start in range(1, num_days - 4):
+            six_work = model.NewBoolVar(f"six_work_{nurse_id}_{start}")
+            off_total = sum(
+                x[nurse_id, day, "OFF"] for day in range(start, start + 6)
+            )
+            model.Add(off_total == 0).OnlyEnforceIf(six_work)
+            model.Add(off_total >= 1).OnlyEnforceIf(six_work.Not())
+            objective_terms.append(six_work * 40)
 
         allowed_lengths = (3,) if name == LEE_HYEMI else (2, 3)
         coverage: dict[int, list[cp_model.IntVar]] = defaultdict(list)
@@ -677,14 +702,18 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                     shift_index += 1
                 run_length = shift_index - shift_start
                 if run_length < 2 or run_length > 5:
-                    violation(
-                        f"{shift.lower()}_block_length",
-                        f"{names[nurse_id]} {shift_start + 1}일 시작 {shift} 연속근무가 {run_length}일입니다.",
-                        nurseId=nurse_id,
-                        day=shift_start + 1,
-                        actual=run_length,
-                        required="2~5",
-                    )
+                    warnings.append({
+                        "type": f"{shift.lower()}_block_preference",
+                        "message": (
+                            f"{names[nurse_id]} {shift_start + 1}일 시작 {shift} "
+                            f"연속근무가 {run_length}일입니다. 권장 범위는 2~5일입니다."
+                        ),
+                        "nurseId": nurse_id,
+                        "day": shift_start + 1,
+                        "actual": run_length,
+                        "preferred": "2~5",
+                        "warning_only": True,
+                    })
 
         work_index = 0
         while work_index < num_days:
@@ -696,14 +725,18 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                 work_index += 1
             work_length = work_index - work_start
             if work_length > 5:
-                violation(
-                    "consecutive_work_limit",
-                    f"{names[nurse_id]} {work_start + 1}일 시작 연속근무가 {work_length}일입니다.",
-                    nurseId=nurse_id,
-                    day=work_start + 1,
-                    actual=work_length,
-                    required="5 이하",
-                )
+                warnings.append({
+                    "type": "consecutive_work_preference",
+                    "message": (
+                        f"{names[nurse_id]} {work_start + 1}일 시작 연속근무가 "
+                        f"{work_length}일입니다. 권장 범위는 최대 5일입니다."
+                    ),
+                    "nurseId": nurse_id,
+                    "day": work_start + 1,
+                    "actual": work_length,
+                    "preferred": "5 이하",
+                    "warning_only": True,
+                })
 
         blocks: list[tuple[int, int]] = []
         index = 0
