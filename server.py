@@ -424,6 +424,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
 
     general_night_totals: list[cp_model.IntVar] = []
     objective_terms: list[cp_model.LinearExpr] = []
+    de_balance_terms: list[cp_model.LinearExpr] = []
+    de_balance_vars: dict[str, tuple[cp_model.LinearExpr, cp_model.LinearExpr, cp_model.IntVar]] = {}
 
     for nurse in workers:
         nurse_id = str(nurse["id"])
@@ -523,8 +525,11 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         d_total = sum(x[nurse_id, day, "D"] for day in range(1, num_days + 1))
         e_total = sum(x[nurse_id, day, "E"] for day in range(1, num_days + 1))
         de_gap = model.NewIntVar(0, num_days, f"de_gap_{nurse_id}")
+        de_excess_3 = model.NewIntVar(0, num_days, f"de_excess_3_{nurse_id}")
         model.AddAbsEquality(de_gap, d_total - e_total)
-        objective_terms.append(de_gap * 4)
+        model.Add(de_excess_3 >= de_gap - 3)
+        de_balance_terms.extend((de_gap, de_excess_3))
+        de_balance_vars[nurse_id] = (d_total, e_total, de_gap)
         objective_terms.append(sum(x[nurse_id, day, "OFF"] for day in range(1, num_days + 1)))
 
     if general_night_totals:
@@ -560,6 +565,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             objective_terms.extend((charge_extra * 3, middle_gap, junior_gap))
 
     objective = sum(objective_terms)
+    de_balance_objective = sum(de_balance_terms)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max(
@@ -596,6 +602,50 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         active_solver = optimizer
         active_status = optimized_status
 
+    balance_baseline_solver = active_solver
+    balance_solver: cp_model.CpSolver | None = None
+    if de_balance_terms:
+        primary_value = int(round(balance_baseline_solver.Value(objective)))
+        model.Add(objective <= primary_value)
+        model.ClearHints()
+        for variable in x.values():
+            model.AddHint(variable, balance_baseline_solver.Value(variable))
+        model.Minimize(de_balance_objective)
+        balance_solver = cp_model.CpSolver()
+        balance_solver.parameters.max_time_in_seconds = min(
+            15, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 5)
+        )
+        balance_solver.parameters.num_search_workers = 8
+        balance_solver.parameters.random_seed = 202607
+        balance_status = balance_solver.Solve(model)
+        if balance_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            active_solver = balance_solver
+            active_status = balance_status
+
+    def de_balance_snapshot(snapshot_solver: cp_model.CpSolver) -> dict[str, Any]:
+        individual: list[dict[str, Any]] = []
+        for nurse in workers:
+            nurse_id = str(nurse["id"])
+            d_total, e_total, de_gap = de_balance_vars[nurse_id]
+            individual.append({
+                "nurse_id": nurse_id,
+                "name": nurse_name(nurse),
+                "day_count": snapshot_solver.Value(d_total),
+                "evening_count": snapshot_solver.Value(e_total),
+                "difference": snapshot_solver.Value(de_gap),
+            })
+        average = (
+            sum(item["difference"] for item in individual) / len(individual)
+            if individual else 0
+        )
+        return {
+            "average_difference": round(average, 3),
+            "individual": individual,
+        }
+
+    balance_before = de_balance_snapshot(balance_baseline_solver)
+    balance_after = de_balance_snapshot(active_solver)
+
     schedule: dict[str, list[str]] = {}
     for nurse in workers:
         nurse_id = str(nurse["id"])
@@ -622,7 +672,17 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         "staffing_summary": validation["staffing_summary"],
         "grade_summary": validation["grade_summary"],
         "individual_shift_counts": validation["individual_shift_counts"],
-        "solver_seconds": round(solver.WallTime() + (optimizer.WallTime() if active_solver is optimizer else 0), 3),
+        "de_balance_summary": {
+            "before_average_difference": balance_before["average_difference"],
+            "after_average_difference": balance_after["average_difference"],
+            "individual": balance_after["individual"],
+        },
+        "solver_seconds": round(
+            solver.WallTime()
+            + (optimizer.WallTime() if optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else 0)
+            + (balance_solver.WallTime() if balance_solver is not None and active_solver is balance_solver else 0),
+            3,
+        ),
         "status": active_solver.StatusName(active_status),
     }
 
