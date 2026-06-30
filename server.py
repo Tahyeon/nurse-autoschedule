@@ -435,6 +435,30 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             model.Add(x[nurse_id, day, "N"] + x[nurse_id, day + 1, "D"] <= 1)
             model.Add(x[nurse_id, day, "N"] + x[nurse_id, day + 1, "E"] <= 1)
 
+        # Keep D/E in practical 2-5 day runs instead of isolated workdays.
+        for shift in ("D", "E"):
+            for start in range(1, num_days - 4):
+                model.Add(
+                    sum(x[nurse_id, day, shift] for day in range(start, start + 6)) <= 5
+                )
+            model.Add(x[nurse_id, 1, shift] <= x[nurse_id, 2, shift])
+            for day in range(2, num_days):
+                model.Add(
+                    x[nurse_id, day, shift]
+                    <= x[nurse_id, day - 1, shift] + x[nurse_id, day + 1, shift]
+                )
+            model.Add(x[nurse_id, num_days, shift] <= x[nurse_id, num_days - 1, shift])
+
+        # Any uninterrupted combination of D/E/N is limited to five days.
+        for start in range(1, num_days - 4):
+            model.Add(
+                sum(
+                    x[nurse_id, day, shift]
+                    for day in range(start, start + 6)
+                    for shift in WORK_SHIFTS
+                ) <= 5
+            )
+
         allowed_lengths = (3,) if name == LEE_HYEMI else (2, 3)
         coverage: dict[int, list[cp_model.IntVar]] = defaultdict(list)
         employee_blocks: list[cp_model.IntVar] = []
@@ -641,6 +665,45 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                 violation("E_TO_D", f"{names[nurse_id]} {day}일 E → {day + 1}일 D", nurseId=nurse_id, day=day + 1)
             if row[day - 1] == "N" and row[day] in {"D", "E"}:
                 violation("N_TO_DE", f"{names[nurse_id]} {day}일 N → {day + 1}일 {row[day]}", nurseId=nurse_id, day=day + 1)
+
+        for shift in ("D", "E"):
+            shift_index = 0
+            while shift_index < num_days:
+                if row[shift_index] != shift:
+                    shift_index += 1
+                    continue
+                shift_start = shift_index
+                while shift_index < num_days and row[shift_index] == shift:
+                    shift_index += 1
+                run_length = shift_index - shift_start
+                if run_length < 2 or run_length > 5:
+                    violation(
+                        f"{shift.lower()}_block_length",
+                        f"{names[nurse_id]} {shift_start + 1}일 시작 {shift} 연속근무가 {run_length}일입니다.",
+                        nurseId=nurse_id,
+                        day=shift_start + 1,
+                        actual=run_length,
+                        required="2~5",
+                    )
+
+        work_index = 0
+        while work_index < num_days:
+            if row[work_index] == "OFF":
+                work_index += 1
+                continue
+            work_start = work_index
+            while work_index < num_days and row[work_index] != "OFF":
+                work_index += 1
+            work_length = work_index - work_start
+            if work_length > 5:
+                violation(
+                    "consecutive_work_limit",
+                    f"{names[nurse_id]} {work_start + 1}일 시작 연속근무가 {work_length}일입니다.",
+                    nurseId=nurse_id,
+                    day=work_start + 1,
+                    actual=work_length,
+                    required="5 이하",
+                )
 
         blocks: list[tuple[int, int]] = []
         index = 0
