@@ -449,7 +449,10 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
 
     general_night_totals: list[cp_model.IntVar] = []
     objective_terms: list[cp_model.LinearExpr] = []
-    de_balance_terms: list[cp_model.LinearExpr] = []
+    de_extreme_terms: list[cp_model.LinearExpr] = []
+    de_shortfall_terms: list[cp_model.LinearExpr] = []
+    de_excess_terms: list[cp_model.LinearExpr] = []
+    de_gap_terms: list[cp_model.LinearExpr] = []
     new_quality_terms: list[cp_model.LinearExpr] = []
     de_balance_vars: dict[str, tuple[cp_model.LinearExpr, cp_model.LinearExpr, cp_model.IntVar]] = {}
     off_shortfall_vars: dict[str, cp_model.IntVar] = {}
@@ -702,10 +705,23 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         d_total = sum(x[nurse_id, day, "D"] for day in range(1, num_days + 1))
         e_total = sum(x[nurse_id, day, "E"] for day in range(1, num_days + 1))
         de_gap = model.NewIntVar(0, num_days, f"de_gap_{nurse_id}")
+        d_shortfall = model.NewIntVar(0, 4, f"d_shortfall_{nurse_id}")
+        e_shortfall = model.NewIntVar(0, 4, f"e_shortfall_{nurse_id}")
         de_excess_4 = model.NewIntVar(0, num_days, f"de_excess_4_{nurse_id}")
+        d_very_low = model.NewBoolVar(f"d_very_low_{nurse_id}")
+        e_very_low = model.NewBoolVar(f"e_very_low_{nurse_id}")
         model.AddAbsEquality(de_gap, d_total - e_total)
-        model.Add(de_excess_4 >= de_gap - 4)
-        de_balance_terms.extend((de_gap, de_excess_4))
+        model.AddMaxEquality(d_shortfall, [4 - d_total, 0])
+        model.AddMaxEquality(e_shortfall, [4 - e_total, 0])
+        model.AddMaxEquality(de_excess_4, [de_gap - 4, 0])
+        model.Add(d_total <= 2).OnlyEnforceIf(d_very_low)
+        model.Add(d_total >= 3).OnlyEnforceIf(d_very_low.Not())
+        model.Add(e_total <= 2).OnlyEnforceIf(e_very_low)
+        model.Add(e_total >= 3).OnlyEnforceIf(e_very_low.Not())
+        de_extreme_terms.extend((d_very_low, e_very_low))
+        de_shortfall_terms.extend((d_shortfall, e_shortfall))
+        de_excess_terms.append(de_excess_4)
+        de_gap_terms.append(de_gap)
         de_balance_vars[nurse_id] = (d_total, e_total, de_gap)
 
     if general_night_totals:
@@ -759,8 +775,13 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             ))
 
     objective = sum(objective_terms)
-    de_balance_objective = sum(de_balance_terms)
-    new_quality_objective = sum(new_quality_terms) + de_balance_objective * 2
+    de_balance_objective = (
+        sum(de_extreme_terms) * 10_000_000_000
+        + sum(de_shortfall_terms) * 10_000_000
+        + sum(de_excess_terms) * 10_000
+        + sum(de_gap_terms)
+    )
+    new_quality_objective = sum(new_quality_terms)
     total_off_shortfall = sum(off_shortfall_vars.values())
 
     solver = cp_model.CpSolver()
@@ -787,25 +808,11 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     model.Add(total_off_shortfall == best_off_shortfall)
     active_solver = solver
     active_status = status
-    for variable in x.values():
-        model.AddHint(variable, solver.Value(variable))
-    model.Minimize(objective)
-    optimizer = cp_model.CpSolver()
-    optimizer.parameters.max_time_in_seconds = min(
-        15, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 4)
-    )
-    optimizer.parameters.num_search_workers = 8
-    optimizer.parameters.random_seed = 202607
-    optimized_status = optimizer.Solve(model)
-    if optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        active_solver = optimizer
-        active_status = optimized_status
-
-    balance_baseline_solver = active_solver
+    balance_baseline_solver = solver
     balance_solver: cp_model.CpSolver | None = None
-    if de_balance_terms:
-        primary_value = int(round(balance_baseline_solver.Value(objective)))
-        model.Add(objective <= primary_value)
+    balance_status: cp_model.CpSolverStatus | None = None
+    balance_succeeded = False
+    if de_balance_vars:
         model.ClearHints()
         for variable in x.values():
             model.AddHint(variable, balance_baseline_solver.Value(variable))
@@ -820,18 +827,41 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         if balance_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             active_solver = balance_solver
             active_status = balance_status
+            balance_succeeded = True
+            best_de_balance = int(round(balance_solver.Value(de_balance_objective)))
+            model.Add(de_balance_objective <= best_de_balance)
+
+    optimizer: cp_model.CpSolver | None = None
+    optimized_status: cp_model.CpSolverStatus | None = None
+    if balance_succeeded:
+        model.ClearHints()
+        for variable in x.values():
+            model.AddHint(variable, active_solver.Value(variable))
+        model.Minimize(objective)
+        optimizer = cp_model.CpSolver()
+        optimizer.parameters.max_time_in_seconds = min(
+            15, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 4)
+        )
+        optimizer.parameters.num_search_workers = 8
+        optimizer.parameters.random_seed = 202607
+        optimized_status = optimizer.Solve(model)
+        if optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            active_solver = optimizer
+            active_status = optimized_status
+            best_primary_value = int(round(optimizer.Value(objective)))
+            model.Add(objective <= best_primary_value)
 
     quality_baseline_solver = active_solver
     quality_baseline_value = int(round(quality_baseline_solver.Value(new_quality_objective)))
     quality_solver: cp_model.CpSolver | None = None
     quality_status: cp_model.CpSolverStatus | None = None
-    if new_quality_terms:
+    if (
+        new_quality_terms
+        and optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+    ):
         # Preserve every earlier optimization level. The baseline solution is
         # always valid, so a timeout or UNKNOWN result can safely fall back to it.
         model.Add(new_quality_objective <= quality_baseline_value)
-        if balance_solver is not None and active_solver is balance_solver:
-            best_de_balance = int(round(active_solver.Value(de_balance_objective)))
-            model.Add(de_balance_objective <= best_de_balance)
         model.ClearHints()
         for variable in x.values():
             model.AddHint(variable, quality_baseline_solver.Value(variable))
@@ -902,6 +932,12 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             "before_average_difference": balance_before["average_difference"],
             "after_average_difference": balance_after["average_difference"],
             "individual": balance_after["individual"],
+            "status": (
+                balance_solver.StatusName(balance_status)
+                if balance_solver is not None and balance_status is not None
+                else "SKIPPED"
+            ),
+            "fallback_used": not balance_succeeded,
         },
         "soft_quality_summary": {
             "baseline_penalty": quality_baseline_value,
@@ -918,7 +954,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         },
         "solver_seconds": round(
             solver.WallTime()
-            + optimizer.WallTime()
+            + (optimizer.WallTime() if optimizer is not None else 0)
             + (balance_solver.WallTime() if balance_solver is not None else 0)
             + (quality_solver.WallTime() if quality_solver is not None else 0),
             3,
@@ -1005,6 +1041,37 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                 "name": names[nurse_id],
                 "actual": counts["OFF"],
                 "preferred": minimum_off,
+                "warning_only": True,
+            })
+        for shift in ("D", "E"):
+            if counts[shift] < 4:
+                warnings.append({
+                    "type": f"{shift.lower()}_below_preferred",
+                    "message": (
+                        f"{names[nurse_id]} {shift} 근무가 {counts[shift]}회입니다. "
+                        "권장 횟수는 4회 이상입니다."
+                    ),
+                    "nurseId": nurse_id,
+                    "name": names[nurse_id],
+                    "shift": shift,
+                    "actual": counts[shift],
+                    "preferred": "4 이상",
+                    "warning_only": True,
+                })
+        de_difference = abs(counts["D"] - counts["E"])
+        if de_difference > 4:
+            warnings.append({
+                "type": "de_balance_preference",
+                "message": (
+                    f"{names[nurse_id]} D/E 차이가 {de_difference}회입니다. "
+                    "권장 차이는 4회 이하입니다."
+                ),
+                "nurseId": nurse_id,
+                "name": names[nurse_id],
+                "actual": de_difference,
+                "preferred": "4 이하",
+                "day_count": counts["D"],
+                "evening_count": counts["E"],
                 "warning_only": True,
             })
         for day in range(1, num_days):
