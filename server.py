@@ -139,7 +139,13 @@ def balanced_staffing_targets(
     maximum: dict[str, int],
 ) -> list[dict[str, int]]:
     targets = [{shift: minimum[shift] for shift in WORK_SHIFTS} for _ in range(num_days)]
-    remaining = worker_count * (num_days - exact_off) - num_days * sum(minimum.values())
+    exact_work_slots = worker_count * (num_days - exact_off)
+    required_work_slots = num_days * sum(minimum.values())
+    relaxation_capacity = worker_count if exact_off > 0 else 0
+    work_slots = max(exact_work_slots, required_work_slots)
+    if work_slots > exact_work_slots + relaxation_capacity:
+        raise ValueError("OFF를 직원별 1개까지 줄여도 일별 최소 인원을 채울 수 없습니다.")
+    remaining = work_slots - required_work_slots
     for shift in WORK_SHIFTS:
         while remaining > 0 and any(day[shift] < maximum[shift] for day in targets):
             for day in targets:
@@ -326,20 +332,29 @@ def precheck(
             "required": sum(minimum.values()),
             "message": "3교대 직원 수가 하루 D/E/N 최소 인원 합계보다 적습니다.",
         })
-    available_work_max = count * (num_days - minimum_off)
+    exact_work_slots = count * (num_days - minimum_off)
+    relaxed_work_slots = exact_work_slots + (count if minimum_off > 0 else 0)
     required_work_min = num_days * sum(minimum.values())
     allowed_work_max = num_days * sum(maximum.values())
-    if available_work_max < required_work_min:
+    if relaxed_work_slots < required_work_min:
         hard.append({
             "type": "required_off_capacity",
-            "actual": available_work_max,
+            "actual": relaxed_work_slots,
             "required": required_work_min,
-            "message": "required_off를 보장하면 D/E/N 최소 인원을 채울 수 없습니다.",
+            "message": "OFF를 직원별 1개까지 줄여도 D/E/N 최소 인원을 채울 수 없습니다.",
         })
-    if available_work_max > allowed_work_max:
+    elif exact_work_slots < required_work_min:
+        warnings.append({
+            "type": "off_relaxation_required",
+            "actual": exact_work_slots,
+            "required": required_work_min,
+            "message": "일별 최소 인원을 충족하기 위해 일부 직원의 OFF가 설정값보다 1개 적을 수 있습니다.",
+            "warning_only": True,
+        })
+    if exact_work_slots > allowed_work_max:
         hard.append({
             "type": "required_off_exceeds_daily_maximum_capacity",
-            "actual": available_work_max,
+            "actual": exact_work_slots,
             "required": allowed_work_max,
             "message": "required_off를 정확히 적용하면 D/E/N 최대 인원을 초과합니다.",
         })
@@ -436,12 +451,21 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     objective_terms: list[cp_model.LinearExpr] = []
     de_balance_terms: list[cp_model.LinearExpr] = []
     de_balance_vars: dict[str, tuple[cp_model.LinearExpr, cp_model.LinearExpr, cp_model.IntVar]] = {}
+    off_shortfall_vars: dict[str, cp_model.IntVar] = {}
 
     for nurse in workers:
         nurse_id = str(nurse["id"])
         name = nurse_name(nurse)
 
-        model.Add(sum(x[nurse_id, day, "OFF"] for day in range(1, num_days + 1)) == minimum_off)
+        off_shortfall = model.NewIntVar(
+            0, 1 if minimum_off > 0 else 0, f"off_shortfall_{nurse_id}"
+        )
+        off_shortfall_vars[nurse_id] = off_shortfall
+        model.Add(
+            sum(x[nurse_id, day, "OFF"] for day in range(1, num_days + 1))
+            + off_shortfall
+            == minimum_off
+        )
         for day in range(1, num_days):
             model.Add(x[nurse_id, day, "E"] + x[nurse_id, day + 1, "D"] <= 1)
             model.Add(x[nurse_id, day, "N"] + x[nurse_id, day + 1, "D"] <= 1)
@@ -579,7 +603,6 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         model.Add(de_excess_3 >= de_gap - 3)
         de_balance_terms.extend((de_gap, de_excess_3))
         de_balance_vars[nurse_id] = (d_total, e_total, de_gap)
-        objective_terms.append(sum(x[nurse_id, day, "OFF"] for day in range(1, num_days + 1)))
 
     if general_night_totals:
         min_night = model.NewIntVar(0, num_days, "general_min_night")
@@ -615,6 +638,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
 
     objective = sum(objective_terms)
     de_balance_objective = sum(de_balance_terms)
+    total_off_shortfall = sum(off_shortfall_vars.values())
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max(
@@ -622,6 +646,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     )
     solver.parameters.num_search_workers = 8
     solver.parameters.random_seed = 202607
+    model.Minimize(total_off_shortfall)
     status = solver.Solve(model)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -635,6 +660,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             solver.StatusName(status),
         )
 
+    best_off_shortfall = solver.Value(total_off_shortfall)
+    model.Add(total_off_shortfall == best_off_shortfall)
     active_solver = solver
     active_status = status
     for variable in x.values():
@@ -721,6 +748,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         "staffing_summary": validation["staffing_summary"],
         "grade_summary": validation["grade_summary"],
         "individual_shift_counts": validation["individual_shift_counts"],
+        "off_shortfall_count": best_off_shortfall,
         "de_balance_summary": {
             "before_average_difference": balance_before["average_difference"],
             "after_average_difference": balance_after["average_difference"],
@@ -796,15 +824,26 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
 
         counts = Counter(row)
         counts_summary.append({"nurseId": nurse_id, "name": names[nurse_id], **{s: counts[s] for s in SHIFTS}})
-        if counts["OFF"] != minimum_off:
+        allowed_off_counts = {minimum_off, max(0, minimum_off - 1)}
+        if counts["OFF"] not in allowed_off_counts:
             violation(
                 "off_count_mismatch",
-                f"{names[nurse_id]} OFF {counts['OFF']}개 / 기준 {minimum_off}개",
+                f"{names[nurse_id]} OFF {counts['OFF']}개 / 허용 {minimum_off}개 또는 {max(0, minimum_off - 1)}개",
                 nurseId=nurse_id,
                 name=names[nurse_id],
                 actual=counts["OFF"],
-                required=minimum_off,
+                required=f"{minimum_off} 또는 {max(0, minimum_off - 1)}",
             )
+        elif minimum_off > 0 and counts["OFF"] == minimum_off - 1:
+            warnings.append({
+                "type": "off_one_below_target",
+                "message": f"{names[nurse_id]} OFF가 목표 {minimum_off}개보다 1개 적은 {counts['OFF']}개입니다.",
+                "nurseId": nurse_id,
+                "name": names[nurse_id],
+                "actual": counts["OFF"],
+                "preferred": minimum_off,
+                "warning_only": True,
+            })
         for day in range(1, num_days):
             if row[day - 1] == "E" and row[day] == "D":
                 violation("E_TO_D", f"{names[nurse_id]} {day}일 E → {day + 1}일 D", nurseId=nurse_id, day=day + 1)
