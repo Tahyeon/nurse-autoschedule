@@ -450,12 +450,40 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     general_night_totals: list[cp_model.IntVar] = []
     objective_terms: list[cp_model.LinearExpr] = []
     de_balance_terms: list[cp_model.LinearExpr] = []
+    new_quality_terms: list[cp_model.LinearExpr] = []
     de_balance_vars: dict[str, tuple[cp_model.LinearExpr, cp_model.LinearExpr, cp_model.IntVar]] = {}
     off_shortfall_vars: dict[str, cp_model.IntVar] = {}
+
+    def soft_pattern(
+        name: str,
+        terms: list[cp_model.LinearExpr | int],
+        weight: int,
+    ) -> cp_model.IntVar:
+        matched = model.NewBoolVar(name)
+        total = sum(terms)
+        model.Add(total == len(terms)).OnlyEnforceIf(matched)
+        model.Add(total <= len(terms) - 1).OnlyEnforceIf(matched.Not())
+        new_quality_terms.append(matched * weight)
+        return matched
 
     for nurse in workers:
         nurse_id = str(nurse["id"])
         name = nurse_name(nurse)
+        previous_row = previous_shifts(payload, nurse)
+
+        def shift_expr(day: int, shift: str) -> cp_model.LinearExpr | int | None:
+            if day >= 1:
+                if day > num_days:
+                    return None
+                return x[nurse_id, day, shift]
+            previous_index = len(previous_row) + day - 1
+            if previous_index < 0 or previous_index >= len(previous_row):
+                return None
+            return int(previous_row[previous_index] == shift)
+
+        def work_expr(day: int) -> cp_model.LinearExpr | int | None:
+            off = shift_expr(day, "OFF")
+            return None if off is None else 1 - off
 
         off_shortfall = model.NewIntVar(
             0, 1 if minimum_off > 0 else 0, f"off_shortfall_{nurse_id}"
@@ -474,7 +502,6 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         # Prefer practical D/E runs without making them hard constraints.
         for shift in ("D", "E"):
             first_single = model.NewBoolVar(f"single_{shift}_{nurse_id}_1")
-            previous_row = previous_shifts(payload, nurse)
             previous_same_shift = bool(previous_row and previous_row[-1] == shift)
             if previous_same_shift:
                 model.Add(first_single == 0)
@@ -559,6 +586,83 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             model.Add(current_work_total <= current_count - 1).OnlyEnforceIf(boundary_six_work.Not())
             objective_terms.append(boundary_six_work * 40)
 
+        # Lowest-priority quality preferences. Every indicator only contributes
+        # to the final objective and never restricts schedule feasibility.
+        first_combined_day = 1 - len(previous_row)
+        for start in range(first_combined_day, num_days - 4):
+            window = [work_expr(day) for day in range(start, start + 6)]
+            if start + 5 < 1 or any(term is None for term in window):
+                continue
+            soft_pattern(
+                f"quality_six_work_{nurse_id}_{start}",
+                window,
+                60,
+            )
+
+        for day in range(1, num_days):
+            before = work_expr(day - 1)
+            current_off = shift_expr(day, "OFF")
+            after = work_expr(day + 1)
+            if before is not None and current_off is not None and after is not None:
+                soft_pattern(
+                    f"quality_isolated_off_{nurse_id}_{day}",
+                    [before, current_off, after],
+                    18,
+                )
+
+            for shift in ("D", "E"):
+                current = shift_expr(day, shift)
+                previous_same = shift_expr(day - 1, shift)
+                next_same = shift_expr(day + 1, shift)
+                if current is None or previous_same is None or next_same is None:
+                    continue
+                soft_pattern(
+                    f"quality_single_{shift}_{nurse_id}_{day}",
+                    [current, 1 - previous_same, 1 - next_same],
+                    16,
+                )
+
+        for start in range(first_combined_day, num_days - 3):
+            alternating = [
+                work_expr(start),
+                shift_expr(start + 1, "OFF"),
+                work_expr(start + 2),
+                shift_expr(start + 3, "OFF"),
+                work_expr(start + 4),
+            ]
+            if start + 4 < 1 or any(term is None for term in alternating):
+                continue
+            soft_pattern(
+                f"quality_alternating_work_off_{nurse_id}_{start}",
+                alternating,
+                28,
+            )
+
+        transition_start = 0 if previous_row else 1
+        for day in range(transition_start, num_days):
+            day_shift = shift_expr(day, "D")
+            next_night = shift_expr(day + 1, "N")
+            if day_shift is not None and next_night is not None:
+                transition_weight = 18 if role_group(nurse.get("role")) == "junior" else 10
+                soft_pattern(
+                    f"quality_d_to_n_{nurse_id}_{day}",
+                    [day_shift, next_night],
+                    transition_weight,
+                )
+
+        triple_start = -1 if len(previous_row) >= 2 else (0 if previous_row else 1)
+        for day in range(triple_start, num_days - 1):
+            evening = shift_expr(day, "E")
+            middle_off = shift_expr(day + 1, "OFF")
+            following_day = shift_expr(day + 2, "D")
+            if evening is None or middle_off is None or following_day is None:
+                continue
+            soft_pattern(
+                f"quality_e_off_d_{nurse_id}_{day}",
+                [evening, middle_off, following_day],
+                12,
+            )
+
         allowed_lengths = (3,) if name == LEE_HYEMI else (2, 3)
         coverage: dict[int, list[cp_model.IntVar]] = defaultdict(list)
         employee_blocks: list[cp_model.IntVar] = []
@@ -598,10 +702,10 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         d_total = sum(x[nurse_id, day, "D"] for day in range(1, num_days + 1))
         e_total = sum(x[nurse_id, day, "E"] for day in range(1, num_days + 1))
         de_gap = model.NewIntVar(0, num_days, f"de_gap_{nurse_id}")
-        de_excess_3 = model.NewIntVar(0, num_days, f"de_excess_3_{nurse_id}")
+        de_excess_4 = model.NewIntVar(0, num_days, f"de_excess_4_{nurse_id}")
         model.AddAbsEquality(de_gap, d_total - e_total)
-        model.Add(de_excess_3 >= de_gap - 3)
-        de_balance_terms.extend((de_gap, de_excess_3))
+        model.Add(de_excess_4 >= de_gap - 4)
+        de_balance_terms.extend((de_gap, de_excess_4))
         de_balance_vars[nurse_id] = (d_total, e_total, de_gap)
 
     if general_night_totals:
@@ -636,8 +740,27 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             model.AddAbsEquality(junior_gap, junior_count - 3)
             objective_terms.extend((charge_extra * 3, middle_gap, junior_gap))
 
+            charge_over_two = model.NewIntVar(
+                0, len(workers), f"quality_charge_over_two_{day}_{shift}"
+            )
+            middle_over_three = model.NewIntVar(
+                0, len(workers), f"quality_middle_over_three_{day}_{shift}"
+            )
+            junior_over_four = model.NewIntVar(
+                0, len(workers), f"quality_junior_over_four_{day}_{shift}"
+            )
+            model.Add(charge_over_two >= charge_count - 2)
+            model.Add(middle_over_three >= middle_count - 3)
+            model.Add(junior_over_four >= junior_count - 4)
+            new_quality_terms.extend((
+                charge_over_two * 4,
+                middle_over_three * 4,
+                junior_over_four * 8,
+            ))
+
     objective = sum(objective_terms)
     de_balance_objective = sum(de_balance_terms)
+    new_quality_objective = sum(new_quality_terms) + de_balance_objective * 2
     total_off_shortfall = sum(off_shortfall_vars.values())
 
     solver = cp_model.CpSolver()
@@ -698,6 +821,32 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             active_solver = balance_solver
             active_status = balance_status
 
+    quality_baseline_solver = active_solver
+    quality_baseline_value = int(round(quality_baseline_solver.Value(new_quality_objective)))
+    quality_solver: cp_model.CpSolver | None = None
+    quality_status: cp_model.CpSolverStatus | None = None
+    if new_quality_terms:
+        # Preserve every earlier optimization level. The baseline solution is
+        # always valid, so a timeout or UNKNOWN result can safely fall back to it.
+        model.Add(new_quality_objective <= quality_baseline_value)
+        if balance_solver is not None and active_solver is balance_solver:
+            best_de_balance = int(round(active_solver.Value(de_balance_objective)))
+            model.Add(de_balance_objective <= best_de_balance)
+        model.ClearHints()
+        for variable in x.values():
+            model.AddHint(variable, quality_baseline_solver.Value(variable))
+        model.Minimize(new_quality_objective)
+        quality_solver = cp_model.CpSolver()
+        quality_solver.parameters.max_time_in_seconds = min(
+            20, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 5)
+        )
+        quality_solver.parameters.num_search_workers = 8
+        quality_solver.parameters.random_seed = 202607
+        quality_status = quality_solver.Solve(model)
+        if quality_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            active_solver = quality_solver
+            active_status = quality_status
+
     def de_balance_snapshot(snapshot_solver: cp_model.CpSolver) -> dict[str, Any]:
         individual: list[dict[str, Any]] = []
         for nurse in workers:
@@ -754,10 +903,24 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             "after_average_difference": balance_after["average_difference"],
             "individual": balance_after["individual"],
         },
+        "soft_quality_summary": {
+            "baseline_penalty": quality_baseline_value,
+            "final_penalty": int(round(active_solver.Value(new_quality_objective))),
+            "status": (
+                quality_solver.StatusName(quality_status)
+                if quality_solver is not None and quality_status is not None
+                else "SKIPPED"
+            ),
+            "fallback_used": bool(
+                quality_solver is not None
+                and quality_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+            ),
+        },
         "solver_seconds": round(
             solver.WallTime()
-            + (optimizer.WallTime() if optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else 0)
-            + (balance_solver.WallTime() if balance_solver is not None and active_solver is balance_solver else 0),
+            + optimizer.WallTime()
+            + (balance_solver.WallTime() if balance_solver is not None else 0)
+            + (quality_solver.WallTime() if quality_solver is not None else 0),
             3,
         ),
         "status": active_solver.StatusName(active_status),
