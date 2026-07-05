@@ -197,6 +197,42 @@ def previous_boundary(
     return fixed, previous_ends_evening, trailing_nights
 
 
+def previous_trailing_work_days(payload: SolveRequest, nurse: dict[str, Any]) -> int:
+    count = 0
+    for value in reversed(previous_shifts(payload, nurse)):
+        if value == "OFF":
+            break
+        count += 1
+    return count
+
+
+def previous_night_cooldown_days(
+    payload: SolveRequest,
+    nurse: dict[str, Any],
+    num_days: int,
+) -> list[int]:
+    row = previous_shifts(payload, nurse)
+    if not row or "N" not in row:
+        return []
+
+    trailing_nights = 0
+    for value in reversed(row):
+        if value != "N":
+            break
+        trailing_nights += 1
+
+    if trailing_nights:
+        target_length = 3 if nurse_name(nurse) == LEE_HYEMI else 2
+        continuation = max(0, target_length - trailing_nights)
+        start = continuation + 1
+        return list(range(start, min(num_days, continuation + 4) + 1))
+
+    last_night = max(index for index, value in enumerate(row) if value == "N")
+    days_since_night_end = len(row) - last_night - 1
+    remaining = max(0, 4 - days_since_night_end)
+    return list(range(1, min(num_days, remaining) + 1))
+
+
 def solve_night_plan(
     payload: SolveRequest,
     workers: list[dict[str, Any]],
@@ -218,6 +254,8 @@ def solve_night_plan(
             night[nurse_id, day] = model.NewBoolVar(f"night_{nurse_id}_{day}")
             if (nurse_id, day) in off_requests or boundaries[nurse_id][0].get(day) == "OFF":
                 model.Add(night[nurse_id, day] == 0)
+        for day in previous_night_cooldown_days(payload, nurse, num_days):
+            model.Add(night[nurse_id, day] == 0)
 
         coverage: dict[int, list[cp_model.IntVar]] = defaultdict(list)
         employee_blocks: list[cp_model.IntVar] = []
@@ -232,7 +270,7 @@ def solve_night_plan(
                 employee_blocks.append(block)
                 for day in range(start, start + length):
                     coverage[day].append(block)
-                for recovery_day in (start + length, start + length + 1):
+                for recovery_day in range(start + length, start + length + 4):
                     if recovery_day <= num_days:
                         model.Add(night[nurse_id, recovery_day] == 0).OnlyEnforceIf(block)
 
@@ -304,6 +342,60 @@ def infeasible_response(message: str, reasons: list[dict[str, Any]], status: str
     }
 
 
+def scheduling_capacity_reasons(
+    payload: SolveRequest,
+    workers: list[dict[str, Any]],
+    num_days: int,
+    minimum: dict[str, int],
+    minimum_off: int,
+    off_requests: set[tuple[str, int]],
+) -> list[dict[str, Any]]:
+    grades = Counter(role_group(n.get("role")) for n in workers)
+    requested_by_grade = Counter()
+    worker_by_id = {str(n["id"]): n for n in workers}
+    for nurse_id, _day in off_requests:
+        nurse = worker_by_id.get(nurse_id)
+        if nurse:
+            requested_by_grade[role_group(nurse.get("role"))] += 1
+
+    reasons: list[dict[str, Any]] = [{
+        "type": "night_staff_capacity",
+        "message": (
+            f"Night는 매일 {minimum['N']}명, 총 {num_days * minimum['N']}명분이 필요합니다. "
+            f"현재 Night 가능 3교대 인원은 {len(workers)}명입니다."
+        ),
+        "required_per_day": minimum["N"],
+        "required_total": num_days * minimum["N"],
+        "available_workers": len(workers),
+    }]
+    for grade in ("charge", "middle"):
+        reasons.append({
+            "type": f"night_{grade}_capacity",
+            "message": (
+                f"Night마다 {grade} 최소 1명이 필요합니다. 현재 {grade} 인원은 "
+                f"{grades[grade]}명이고 확정 OFF 신청은 {requested_by_grade[grade]}건입니다."
+            ),
+            "grade": grade,
+            "available_workers": grades[grade],
+            "confirmed_off_requests": requested_by_grade[grade],
+            "required_assignments": num_days,
+        })
+    reasons.extend((
+        {
+            "type": "night_cooldown_capacity",
+            "message": "각 Night 블록 종료 후 4일 동안 Night 재배정 금지 조건과 날짜별 Night 필요 인원이 충돌할 수 있습니다.",
+            "required": "Night 종료 후 4일간 N 금지",
+        },
+        {
+            "type": "consecutive_work_capacity",
+            "message": "연속근무 최대 5일, OFF 목표, 확정 희망 OFF 및 일별 최소 인원을 동시에 충족해야 합니다.",
+            "required": "6일 연속근무 금지",
+            "off_target": minimum_off,
+        },
+    ))
+    return reasons
+
+
 def precheck(
     payload: SolveRequest,
     workers: list[dict[str, Any]],
@@ -358,6 +450,20 @@ def precheck(
             "required": allowed_work_max,
             "message": "required_off를 정확히 적용하면 D/E/N 최대 인원을 초과합니다.",
         })
+    for nurse in workers:
+        trailing_work = previous_trailing_work_days(payload, nurse)
+        if trailing_work > 5:
+            hard.append({
+                "type": "previous_consecutive_work_exceeds_limit",
+                "nurseId": str(nurse["id"]),
+                "name": nurse_name(nurse),
+                "actual": trailing_work,
+                "required": "5 이하",
+                "message": (
+                    f"{nurse_name(nurse)}의 이전 달 말일 기준 연속근무가 "
+                    f"{trailing_work}일이어서 월 경계 최대 5일 조건을 만족할 수 없습니다."
+                ),
+            })
     for grade in ("charge", "middle"):
         if grades[grade] < 3:
             hard.append({
@@ -402,8 +508,14 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     )
     if not night_plan:
         return infeasible_response(
-            "Night 인원·연속 블록·Grade 조건을 동시에 만족할 수 없습니다.",
-            [{"type": "night_plan_infeasible", "solver_status": night_status}],
+            "Night 가능 인원·연속 블록·종료 후 4일 재배정 금지·Grade 조건을 동시에 만족할 수 없습니다.",
+            [{
+                "type": "night_plan_infeasible",
+                "message": "Night 선행 배치 단계에서 조건을 만족하는 해를 찾지 못했습니다.",
+                "solver_status": night_status,
+            }] + scheduling_capacity_reasons(
+                payload, workers, num_days, minimum, minimum_off, off_requests
+            ),
             night_status,
         )
 
@@ -501,6 +613,23 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             model.Add(x[nurse_id, day, "E"] + x[nurse_id, day + 1, "D"] <= 1)
             model.Add(x[nurse_id, day, "N"] + x[nurse_id, day + 1, "D"] <= 1)
             model.Add(x[nurse_id, day, "N"] + x[nurse_id, day + 1, "E"] <= 1)
+
+        # No employee may work six consecutive days.
+        for start in range(1, num_days - 4):
+            model.Add(sum(
+                x[nurse_id, day, "OFF"]
+                for day in range(start, start + 6)
+            ) >= 1)
+        trailing_work = previous_trailing_work_days(payload, nurse)
+        if 1 <= trailing_work <= 5:
+            boundary_days = min(num_days, 6 - trailing_work)
+            model.Add(sum(
+                x[nurse_id, day, "OFF"]
+                for day in range(1, boundary_days + 1)
+            ) >= 1)
+
+        for day in previous_night_cooldown_days(payload, nurse, num_days):
+            model.Add(x[nurse_id, day, "N"] == 0)
 
         # Prefer practical D/E runs without making them hard constraints.
         for shift in ("D", "E"):
@@ -682,6 +811,9 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 for recovery_day in (start + length, start + length + 1):
                     if recovery_day <= num_days:
                         model.Add(x[nurse_id, recovery_day, "OFF"] == 1).OnlyEnforceIf(block)
+                for cooldown_day in range(start + length, start + length + 4):
+                    if cooldown_day <= num_days:
+                        model.Add(x[nurse_id, cooldown_day, "N"] == 0).OnlyEnforceIf(block)
 
         for day in range(1, num_days + 1):
             if boundaries[nurse_id][0].get(day) == "N":
@@ -800,7 +932,9 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 "type": "constraint_combination_conflict",
                 "message": "OFF, 일별 인원, Grade, Night 블록 및 휴식 조건의 조합에서 해를 찾지 못했습니다.",
                 "solver_status": solver.StatusName(status),
-            }],
+            }] + scheduling_capacity_reasons(
+                payload, workers, num_days, minimum, minimum_off, off_requests
+            ),
             solver.StatusName(status),
         )
 
@@ -1010,6 +1144,20 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                 required="N 연속 또는 OFF",
                 boundary=True,
             )
+        for day in previous_night_cooldown_days(payload, nurse, num_days):
+            if row[day - 1] == "N":
+                violation(
+                    "previous_month_night_cooldown",
+                    (
+                        f"{names[nurse_id]}의 이전 달 Night 종료 후 4일 이내인 "
+                        f"이번 달 {day}일에 Night가 재배정되었습니다."
+                    ),
+                    nurseId=nurse_id,
+                    day=day,
+                    actual="N",
+                    required="이전 Night 종료 후 4일간 N 금지",
+                    boundary=True,
+                )
         for day, expected_shift in boundary_fixed.items():
             if row[day - 1] != expected_shift:
                 violation(
@@ -1132,22 +1280,21 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                     previous_work += 1
             combined_work_length = work_length + previous_work
             if combined_work_length > 5:
-                warnings.append({
-                    "type": (
+                violation(
+                    (
                         "previous_month_consecutive_work_preference"
                         if previous_work else "consecutive_work_preference"
                     ),
-                    "message": (
+                    (
                         f"{names[nurse_id]} {'이전 달부터 이어진 ' if previous_work else ''}연속근무가 "
-                        f"{combined_work_length}일입니다. 권장 범위는 최대 5일입니다."
+                        f"{combined_work_length}일입니다. 연속근무는 최대 5일까지 허용됩니다."
                     ),
-                    "nurseId": nurse_id,
-                    "day": work_start + 1,
-                    "actual": combined_work_length,
-                    "preferred": "5 이하",
-                    "boundary": bool(previous_work),
-                    "warning_only": True,
-                })
+                    nurseId=nurse_id,
+                    day=work_start + 1,
+                    actual=combined_work_length,
+                    required="5 이하",
+                    boundary=bool(previous_work),
+                )
 
         blocks: list[tuple[int, int]] = []
         if previous_night_run and row[0] != "N":
@@ -1205,6 +1352,24 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                     day=index + 1,
                     actual="/".join(recovery),
                     required="OFF/OFF",
+                    boundary=bool(start == 0 and previous_night_run),
+                )
+            cooldown = row[index:min(index + 4, num_days)]
+            next_night_offset = next(
+                (offset for offset, value in enumerate(cooldown) if value == "N"),
+                None,
+            )
+            if next_night_offset is not None:
+                violation(
+                    "night_cooldown",
+                    (
+                        f"{names[nurse_id]} {start + 1}일 시작 Night 블록 종료 후 "
+                        f"{next_night_offset + 1}일 만에 Night가 재배정되었습니다."
+                    ),
+                    nurseId=nurse_id,
+                    day=index + next_night_offset + 1,
+                    actual=f"종료 후 {next_night_offset + 1}일",
+                    required="Night 종료 후 4일간 N 금지",
                     boundary=bool(start == 0 and previous_night_run),
                 )
         if names[nurse_id] == LEE_HYEMI and (len(blocks) != 2 or any(length != 3 for _, length in blocks)):
