@@ -114,6 +114,95 @@ def requested_off(payload: SolveRequest, worker_ids: set[str], num_days: int) ->
     return confirmed, conflicts
 
 
+def requested_assignments(
+    payload: SolveRequest,
+    worker_ids: set[str],
+    num_days: int,
+) -> tuple[dict[tuple[str, int], str], list[dict[str, Any]]]:
+    assignments: dict[tuple[str, int], str] = {}
+    conflicts: list[dict[str, Any]] = []
+    for item in payload.requests:
+        nurse_id = str(item.get("nurseId") or item.get("nurse_id") or "")
+        day = int(item.get("day") or 0)
+        shift = normalize_shift(item.get("shift") or item.get("type"))
+        if nurse_id not in worker_ids or not 1 <= day <= num_days or shift not in SHIFTS:
+            continue
+        key = (nurse_id, day)
+        existing = assignments.get(key)
+        if existing and existing != shift:
+            conflicts.append({
+                "type": "duplicate_shift_request",
+                "nurseId": nurse_id,
+                "day": day,
+                "actual": f"{existing}, {shift}",
+                "required": "하루에 하나의 근무 신청",
+                "message": f"{day}일에 {existing}와 {shift} 신청이 동시에 존재합니다.",
+            })
+            continue
+        assignments[key] = shift
+    return assignments, conflicts
+
+
+def request_boundary_conflicts(
+    payload: SolveRequest,
+    workers: list[dict[str, Any]],
+    assignments: dict[tuple[str, int], str],
+    num_days: int,
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for nurse in workers:
+        nurse_id = str(nurse["id"])
+        fixed, previous_ends_evening, _previous_nights = previous_boundary(
+            payload, nurse, num_days
+        )
+        for day in range(1, num_days + 1):
+            requested = assignments.get((nurse_id, day))
+            if not requested:
+                continue
+            fixed_shift = fixed.get(day)
+            if fixed_shift and fixed_shift != requested:
+                conflicts.append({
+                    "type": "request_previous_boundary_conflict",
+                    "nurseId": nurse_id,
+                    "name": nurse_name(nurse),
+                    "day": day,
+                    "actual": requested,
+                    "required": fixed_shift,
+                    "message": (
+                        f"{nurse_name(nurse)} {day}일 {requested} 신청이 이전 달 "
+                        f"근무에 따른 필수 {fixed_shift}와 충돌합니다."
+                    ),
+                })
+            if day == 1 and previous_ends_evening and requested == "D":
+                conflicts.append({
+                    "type": "request_previous_e_to_d_conflict",
+                    "nurseId": nurse_id,
+                    "name": nurse_name(nurse),
+                    "day": day,
+                    "actual": "이전 달 E → 이번 달 D 신청",
+                    "required": "E 다음날 D 금지",
+                    "message": (
+                        f"{nurse_name(nurse)}의 1일 D 신청이 이전 달 말일 E와 충돌합니다."
+                    ),
+                })
+            if requested == "N" and day in previous_night_cooldown_days(
+                payload, nurse, num_days
+            ):
+                conflicts.append({
+                    "type": "request_night_cooldown_conflict",
+                    "nurseId": nurse_id,
+                    "name": nurse_name(nurse),
+                    "day": day,
+                    "actual": "N 신청",
+                    "required": "이전 Night 종료 후 4일간 N 금지",
+                    "message": (
+                        f"{nurse_name(nurse)} {day}일 N 신청이 이전 달 Night 종료 후 "
+                        "4일 재배정 금지 조건과 충돌합니다."
+                    ),
+                })
+    return conflicts
+
+
 def staffing_limits(payload: SolveRequest) -> tuple[dict[str, int], dict[str, int]]:
     minimum = {
         shift: max(1, int(payload.needs.get(shift) or default))
@@ -238,7 +327,7 @@ def solve_night_plan(
     workers: list[dict[str, Any]],
     num_days: int,
     daily_targets: list[dict[str, int]],
-    off_requests: set[tuple[str, int]],
+    shift_requests: dict[tuple[str, int], str],
 ) -> tuple[dict[str, list[int]], str]:
     model = cp_model.CpModel()
     night: dict[tuple[str, int], cp_model.IntVar] = {}
@@ -252,7 +341,10 @@ def solve_night_plan(
         nurse_id = str(nurse["id"])
         for day in range(1, num_days + 1):
             night[nurse_id, day] = model.NewBoolVar(f"night_{nurse_id}_{day}")
-            if (nurse_id, day) in off_requests or boundaries[nurse_id][0].get(day) == "OFF":
+            requested = shift_requests.get((nurse_id, day))
+            if requested == "N":
+                model.Add(night[nurse_id, day] == 1)
+            elif requested in {"D", "E", "OFF"} or boundaries[nurse_id][0].get(day) == "OFF":
                 model.Add(night[nurse_id, day] == 0)
         for day in previous_night_cooldown_days(payload, nurse, num_days):
             model.Add(night[nurse_id, day] == 0)
@@ -493,7 +585,15 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             [{"type": "staffing_capacity", "message": str(error)}],
             "PRECHECK_FAILED",
         )
-    off_requests, request_conflicts = requested_off(payload, worker_ids, num_days)
+    off_requests, off_request_conflicts = requested_off(payload, worker_ids, num_days)
+    shift_requests, shift_request_conflicts = requested_assignments(
+        payload, worker_ids, num_days
+    )
+    request_conflicts = (
+        off_request_conflicts
+        + shift_request_conflicts
+        + request_boundary_conflicts(payload, workers, shift_requests, num_days)
+    )
     precheck_hard, precheck_warnings = precheck(
         payload, workers, num_days, minimum, maximum, minimum_off, request_conflicts
     )
@@ -504,7 +604,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             "PRECHECK_FAILED",
         )
     night_plan, night_status = solve_night_plan(
-        payload, workers, num_days, daily_targets, off_requests
+        payload, workers, num_days, daily_targets, shift_requests
     )
     if not night_plan:
         return infeasible_response(
@@ -537,8 +637,9 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             fixed_shift = boundaries[nurse_id][0].get(day)
             if fixed_shift:
                 model.Add(x[nurse_id, day, fixed_shift] == 1)
-            if (nurse_id, day) in off_requests:
-                model.Add(x[nurse_id, day, "OFF"] == 1)
+            requested_shift = shift_requests.get((nurse_id, day))
+            if requested_shift:
+                model.Add(x[nurse_id, day, requested_shift] == 1)
         if boundaries[nurse_id][1]:
             model.Add(x[nurse_id, 1, "D"] == 0)
 
@@ -1105,7 +1206,11 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
     groups = {str(n["id"]): role_group(n.get("role")) for n in workers}
     minimum, maximum = staffing_limits(payload)
     minimum_off = required_off(payload)
-    off_requests, request_conflicts = requested_off(payload, worker_ids, num_days)
+    off_requests, off_request_conflicts = requested_off(payload, worker_ids, num_days)
+    shift_requests, shift_request_conflicts = requested_assignments(
+        payload, worker_ids, num_days
+    )
+    request_conflicts = off_request_conflicts + shift_request_conflicts
     hard: list[dict[str, Any]] = []
     warnings = [item for item in request_conflicts if item.get("warning_only")]
     staffing_summary: list[dict[str, Any]] = []
@@ -1381,16 +1486,19 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                 required="3N 블록 2개",
             )
 
-    for nurse_id, day in off_requests:
+    for (nurse_id, day), requested_shift in shift_requests.items():
         row = schedule.get(nurse_id, [])
-        if len(row) >= day and row[day - 1] != "OFF":
+        if len(row) >= day and row[day - 1] != requested_shift:
             violation(
-                "confirmed_off_unmet",
-                f"{names[nurse_id]} {day}일 확정 희망 OFF가 반영되지 않았습니다.",
+                "confirmed_shift_request_unmet",
+                (
+                    f"{names[nurse_id]} {day}일 확정 희망 {requested_shift}가 "
+                    f"반영되지 않았습니다."
+                ),
                 nurseId=nurse_id,
                 day=day,
                 actual=row[day - 1],
-                required="OFF",
+                required=requested_shift,
             )
 
     for day in range(1, num_days + 1):
