@@ -730,8 +730,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     de_extreme_terms: list[cp_model.LinearExpr] = []
     de_shortfall_terms: list[cp_model.LinearExpr] = []
     de_excess_terms: list[cp_model.LinearExpr] = []
-    de_gap_terms: list[cp_model.LinearExpr] = []
     repetition_terms: list[cp_model.LinearExpr] = []
+    single_shift_terms: list[cp_model.LinearExpr] = []
     other_quality_terms: list[cp_model.LinearExpr] = []
     de_balance_vars: dict[str, tuple[cp_model.LinearExpr, cp_model.LinearExpr, cp_model.IntVar]] = {}
     off_shortfall_vars: dict[str, cp_model.IntVar] = {}
@@ -809,7 +809,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 model.Add(first_single <= x[nurse_id, 1, shift])
                 model.Add(first_single + x[nurse_id, 2, shift] <= 1)
                 model.Add(first_single >= x[nurse_id, 1, shift] - x[nurse_id, 2, shift])
-            objective_terms.append(first_single * 30)
+            single_shift_terms.append(first_single * 100)
 
             for day in range(2, num_days):
                 single = model.NewBoolVar(f"single_{shift}_{nurse_id}_{day}")
@@ -822,7 +822,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                     - x[nurse_id, day - 1, shift]
                     - x[nurse_id, day + 1, shift]
                 )
-                objective_terms.append(single * 30)
+                single_shift_terms.append(single * 100)
 
             last_single = model.NewBoolVar(f"single_{shift}_{nurse_id}_{num_days}")
             model.Add(last_single <= x[nurse_id, num_days, shift])
@@ -831,7 +831,18 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 last_single
                 >= x[nurse_id, num_days, shift] - x[nurse_id, num_days - 1, shift]
             )
-            objective_terms.append(last_single * 30)
+            single_shift_terms.append(last_single * 100)
+
+            # Two-to-four day D/E runs are preferred. Five-day runs remain
+            # valid, but receive a small penalty after singleton reduction.
+            for start in range(1, num_days - 3):
+                five_same = model.NewBoolVar(f"five_{shift}_{nurse_id}_{start}")
+                five_total = sum(
+                    x[nurse_id, day, shift] for day in range(start, start + 5)
+                )
+                model.Add(five_total == 5).OnlyEnforceIf(five_same)
+                model.Add(five_total <= 4).OnlyEnforceIf(five_same.Not())
+                single_shift_terms.append(five_same * 10)
 
             for start in range(1, num_days - 4):
                 six_same = model.NewBoolVar(f"six_{shift}_{nurse_id}_{start}")
@@ -904,7 +915,13 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             before = work_expr(day - 1)
             current_off = shift_expr(day, "OFF")
             after = work_expr(day + 1)
-            if before is not None and current_off is not None and after is not None:
+            is_requested_off = (nurse_id, day) in off_requests
+            if (
+                not is_requested_off
+                and before is not None
+                and current_off is not None
+                and after is not None
+            ):
                 soft_pattern(
                     f"quality_isolated_off_{nurse_id}_{day}",
                     [before, current_off, after],
@@ -912,20 +929,13 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                     repetition_terms,
                 )
 
-            for shift in ("D", "E"):
-                current = shift_expr(day, shift)
-                previous_same = shift_expr(day - 1, shift)
-                next_same = shift_expr(day + 1, shift)
-                if current is None or previous_same is None or next_same is None:
-                    continue
-                soft_pattern(
-                    f"quality_single_{shift}_{nurse_id}_{day}",
-                    [current, 1 - previous_same, 1 - next_same],
-                    16,
-                    other_quality_terms,
-                )
-
         for start in range(first_combined_day, num_days - 3):
+            off_days = (start + 1, start + 3)
+            if any(
+                day >= 1 and (nurse_id, day) in off_requests
+                for day in off_days
+            ):
+                continue
             alternating = [
                 work_expr(start),
                 shift_expr(start + 1, "OFF"),
@@ -1027,7 +1037,6 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         de_extreme_terms.extend((d_very_low, e_very_low))
         de_shortfall_terms.extend((d_shortfall, e_shortfall))
         de_excess_terms.append(de_excess_4)
-        de_gap_terms.append(de_gap)
         de_balance_vars[nurse_id] = (d_total, e_total, de_gap)
 
     if general_night_totals:
@@ -1085,9 +1094,9 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         sum(de_extreme_terms) * 10_000_000_000
         + sum(de_shortfall_terms) * 10_000_000
         + sum(de_excess_terms) * 10_000
-        + sum(de_gap_terms)
     )
     repetition_objective = sum(repetition_terms)
+    single_shift_objective = sum(single_shift_terms)
     total_off_shortfall = sum(off_shortfall_vars.values())
     off_dispersion_terms: list[cp_model.IntVar] = []
     role_workers = {
@@ -1185,11 +1194,38 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             best_repetition = int(round(repetition_solver.Value(repetition_objective)))
             model.Add(repetition_objective <= best_repetition)
 
+    single_shift_solver: cp_model.CpSolver | None = None
+    single_shift_status: cp_model.CpSolverStatus | None = None
+    single_shift_succeeded = False
+    single_shift_baseline_value = int(round(
+        active_solver.Value(single_shift_objective)
+    ))
+    if repetition_succeeded:
+        model.ClearHints()
+        for variable in x.values():
+            model.AddHint(variable, active_solver.Value(variable))
+        model.Minimize(single_shift_objective)
+        single_shift_solver = cp_model.CpSolver()
+        single_shift_solver.parameters.max_time_in_seconds = min(
+            20, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 5)
+        )
+        single_shift_solver.parameters.num_search_workers = 8
+        single_shift_solver.parameters.random_seed = 202607
+        single_shift_status = single_shift_solver.Solve(model)
+        if single_shift_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            active_solver = single_shift_solver
+            active_status = single_shift_status
+            single_shift_succeeded = True
+            best_single_shift = int(round(
+                single_shift_solver.Value(single_shift_objective)
+            ))
+            model.Add(single_shift_objective <= best_single_shift)
+
     off_solver: cp_model.CpSolver | None = None
     off_status: cp_model.CpSolverStatus | None = None
     off_succeeded = False
     off_baseline_value = int(round(active_solver.Value(off_objective)))
-    if repetition_succeeded:
+    if single_shift_succeeded:
         model.ClearHints()
         for variable in x.values():
             model.AddHint(variable, active_solver.Value(variable))
@@ -1332,6 +1368,23 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                     and repetition_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
                 ),
             },
+            "single_de_blocks": {
+                "baseline_penalty": single_shift_baseline_value,
+                "final_penalty": int(round(
+                    active_solver.Value(single_shift_objective)
+                )),
+                "status": (
+                    single_shift_solver.StatusName(single_shift_status)
+                    if single_shift_solver is not None
+                    and single_shift_status is not None
+                    else "SKIPPED"
+                ),
+                "fallback_used": bool(
+                    single_shift_solver is not None
+                    and single_shift_status
+                    not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+                ),
+            },
             "off_target_distribution": {
                 "baseline_penalty": off_baseline_value,
                 "final_penalty": int(round(active_solver.Value(off_objective))),
@@ -1363,6 +1416,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             solver.WallTime()
             + (balance_solver.WallTime() if balance_solver is not None else 0)
             + (repetition_solver.WallTime() if repetition_solver is not None else 0)
+            + (single_shift_solver.WallTime() if single_shift_solver is not None else 0)
             + (off_solver.WallTime() if off_solver is not None else 0)
             + (quality_solver.WallTime() if quality_solver is not None else 0),
             3,
