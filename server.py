@@ -488,6 +488,71 @@ def scheduling_capacity_reasons(
     return reasons
 
 
+def schedule_quality_metrics(
+    payload: SolveRequest,
+    schedule: dict[str, list[str]],
+    workers: list[dict[str, Any]],
+    minimum_off: int,
+) -> dict[str, Any]:
+    de_gaps: list[int] = []
+    work_off_work = 0
+    alternating_work_off = 0
+    shortfall_employees: list[dict[str, Any]] = []
+    shortfall_by_role = {role: 0 for role in WORK_GROUPS}
+
+    for nurse in workers:
+        nurse_id = str(nurse["id"])
+        row = list(schedule.get(nurse_id) or [])
+        counts = Counter(row)
+        de_gaps.append(abs(counts["D"] - counts["E"]))
+        if minimum_off > 0 and counts["OFF"] == minimum_off - 1:
+            role = role_group(nurse.get("role"))
+            shortfall_employees.append({
+                "nurse_id": nurse_id,
+                "name": nurse_name(nurse),
+                "role": role,
+                "off_count": counts["OFF"],
+                "target": minimum_off,
+            })
+            if role in shortfall_by_role:
+                shortfall_by_role[role] += 1
+
+        previous = previous_shifts(payload, nurse)
+        combined = previous + row
+        current_start = len(previous)
+        for index in range(0, len(combined) - 2):
+            if index + 2 < current_start:
+                continue
+            window = combined[index:index + 3]
+            if window[0] != "OFF" and window[1] == "OFF" and window[2] != "OFF":
+                work_off_work += 1
+        for index in range(0, len(combined) - 4):
+            if index + 4 < current_start:
+                continue
+            window = combined[index:index + 5]
+            if (
+                window[0] != "OFF"
+                and window[1] == "OFF"
+                and window[2] != "OFF"
+                and window[3] == "OFF"
+                and window[4] != "OFF"
+            ):
+                alternating_work_off += 1
+
+    return {
+        "hard_violation_count": 0,
+        "average_de_difference": round(
+            sum(de_gaps) / len(de_gaps) if de_gaps else 0,
+            3,
+        ),
+        "de_difference_over_4_count": sum(1 for gap in de_gaps if gap > 4),
+        "work_off_work_count": work_off_work,
+        "work_off_work_off_work_count": alternating_work_off,
+        "off_shortfall_employees": shortfall_employees,
+        "off_shortfall_by_role": shortfall_by_role,
+    }
+
+
 def precheck(
     payload: SolveRequest,
     workers: list[dict[str, Any]],
@@ -666,7 +731,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     de_shortfall_terms: list[cp_model.LinearExpr] = []
     de_excess_terms: list[cp_model.LinearExpr] = []
     de_gap_terms: list[cp_model.LinearExpr] = []
-    new_quality_terms: list[cp_model.LinearExpr] = []
+    repetition_terms: list[cp_model.LinearExpr] = []
+    other_quality_terms: list[cp_model.LinearExpr] = []
     de_balance_vars: dict[str, tuple[cp_model.LinearExpr, cp_model.LinearExpr, cp_model.IntVar]] = {}
     off_shortfall_vars: dict[str, cp_model.IntVar] = {}
 
@@ -674,12 +740,13 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         name: str,
         terms: list[cp_model.LinearExpr | int],
         weight: int,
+        bucket: list[cp_model.LinearExpr],
     ) -> cp_model.IntVar:
         matched = model.NewBoolVar(name)
         total = sum(terms)
         model.Add(total == len(terms)).OnlyEnforceIf(matched)
         model.Add(total <= len(terms) - 1).OnlyEnforceIf(matched.Not())
-        new_quality_terms.append(matched * weight)
+        bucket.append(matched * weight)
         return matched
 
     for nurse in workers:
@@ -830,6 +897,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 f"quality_six_work_{nurse_id}_{start}",
                 window,
                 60,
+                other_quality_terms,
             )
 
         for day in range(1, num_days):
@@ -840,7 +908,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 soft_pattern(
                     f"quality_isolated_off_{nurse_id}_{day}",
                     [before, current_off, after],
-                    18,
+                    100,
+                    repetition_terms,
                 )
 
             for shift in ("D", "E"):
@@ -853,6 +922,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                     f"quality_single_{shift}_{nurse_id}_{day}",
                     [current, 1 - previous_same, 1 - next_same],
                     16,
+                    other_quality_terms,
                 )
 
         for start in range(first_combined_day, num_days - 3):
@@ -868,7 +938,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             soft_pattern(
                 f"quality_alternating_work_off_{nurse_id}_{start}",
                 alternating,
-                28,
+                300,
+                repetition_terms,
             )
 
         transition_start = 0 if previous_row else 1
@@ -881,6 +952,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                     f"quality_d_to_n_{nurse_id}_{day}",
                     [day_shift, next_night],
                     transition_weight,
+                    other_quality_terms,
                 )
 
         triple_start = -1 if len(previous_row) >= 2 else (0 if previous_row else 1)
@@ -894,6 +966,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 f"quality_e_off_d_{nurse_id}_{day}",
                 [evening, middle_off, following_day],
                 12,
+                other_quality_terms,
             )
 
         allowed_lengths = (3,) if name == LEE_HYEMI else (2, 3)
@@ -1001,7 +1074,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             model.Add(charge_over_two >= charge_count - 2)
             model.Add(middle_over_three >= middle_count - 3)
             model.Add(junior_over_four >= junior_count - 4)
-            new_quality_terms.extend((
+            other_quality_terms.extend((
                 charge_over_two * 4,
                 middle_over_three * 4,
                 junior_over_four * 8,
@@ -1014,8 +1087,33 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         + sum(de_excess_terms) * 10_000
         + sum(de_gap_terms)
     )
-    new_quality_objective = sum(new_quality_terms)
+    repetition_objective = sum(repetition_terms)
     total_off_shortfall = sum(off_shortfall_vars.values())
+    off_dispersion_terms: list[cp_model.IntVar] = []
+    role_workers = {
+        role: [n for n in workers if role_group(n.get("role")) == role]
+        for role in WORK_GROUPS
+    }
+    for left_index, left_role in enumerate(WORK_GROUPS):
+        for right_role in WORK_GROUPS[left_index + 1:]:
+            left_group = role_workers[left_role]
+            right_group = role_workers[right_role]
+            if not left_group or not right_group:
+                continue
+            left_total = sum(off_shortfall_vars[str(n["id"])] for n in left_group)
+            right_total = sum(off_shortfall_vars[str(n["id"])] for n in right_group)
+            difference = model.NewIntVar(
+                0,
+                len(left_group) * len(right_group),
+                f"off_shortfall_distribution_{left_role}_{right_role}",
+            )
+            model.AddAbsEquality(
+                difference,
+                left_total * len(right_group) - right_total * len(left_group),
+            )
+            off_dispersion_terms.append(difference)
+    off_objective = total_off_shortfall * 10_000 + sum(off_dispersion_terms)
+    other_quality_objective = objective * 1_000 + sum(other_quality_terms)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max(
@@ -1023,7 +1121,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     )
     solver.parameters.num_search_workers = 8
     solver.parameters.random_seed = 202607
-    model.Minimize(total_off_shortfall)
+    model.Minimize(0)
     status = solver.Solve(model)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -1039,8 +1137,6 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             solver.StatusName(status),
         )
 
-    best_off_shortfall = solver.Value(total_off_shortfall)
-    model.Add(total_off_shortfall == best_off_shortfall)
     active_solver = solver
     active_status = status
     balance_baseline_solver = solver
@@ -1066,41 +1162,63 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             best_de_balance = int(round(balance_solver.Value(de_balance_objective)))
             model.Add(de_balance_objective <= best_de_balance)
 
-    optimizer: cp_model.CpSolver | None = None
-    optimized_status: cp_model.CpSolverStatus | None = None
+    repetition_solver: cp_model.CpSolver | None = None
+    repetition_status: cp_model.CpSolverStatus | None = None
+    repetition_succeeded = False
+    repetition_baseline_value = int(round(active_solver.Value(repetition_objective)))
     if balance_succeeded:
         model.ClearHints()
         for variable in x.values():
             model.AddHint(variable, active_solver.Value(variable))
-        model.Minimize(objective)
-        optimizer = cp_model.CpSolver()
-        optimizer.parameters.max_time_in_seconds = min(
-            15, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 4)
+        model.Minimize(repetition_objective)
+        repetition_solver = cp_model.CpSolver()
+        repetition_solver.parameters.max_time_in_seconds = min(
+            20, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 5)
         )
-        optimizer.parameters.num_search_workers = 8
-        optimizer.parameters.random_seed = 202607
-        optimized_status = optimizer.Solve(model)
-        if optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            active_solver = optimizer
-            active_status = optimized_status
-            best_primary_value = int(round(optimizer.Value(objective)))
-            model.Add(objective <= best_primary_value)
+        repetition_solver.parameters.num_search_workers = 8
+        repetition_solver.parameters.random_seed = 202607
+        repetition_status = repetition_solver.Solve(model)
+        if repetition_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            active_solver = repetition_solver
+            active_status = repetition_status
+            repetition_succeeded = True
+            best_repetition = int(round(repetition_solver.Value(repetition_objective)))
+            model.Add(repetition_objective <= best_repetition)
+
+    off_solver: cp_model.CpSolver | None = None
+    off_status: cp_model.CpSolverStatus | None = None
+    off_succeeded = False
+    off_baseline_value = int(round(active_solver.Value(off_objective)))
+    if repetition_succeeded:
+        model.ClearHints()
+        for variable in x.values():
+            model.AddHint(variable, active_solver.Value(variable))
+        model.Minimize(off_objective)
+        off_solver = cp_model.CpSolver()
+        off_solver.parameters.max_time_in_seconds = min(
+            15, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 6)
+        )
+        off_solver.parameters.num_search_workers = 8
+        off_solver.parameters.random_seed = 202607
+        off_status = off_solver.Solve(model)
+        if off_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            active_solver = off_solver
+            active_status = off_status
+            off_succeeded = True
+            best_off = int(round(off_solver.Value(off_objective)))
+            model.Add(off_objective <= best_off)
 
     quality_baseline_solver = active_solver
-    quality_baseline_value = int(round(quality_baseline_solver.Value(new_quality_objective)))
+    quality_baseline_value = int(round(
+        quality_baseline_solver.Value(other_quality_objective)
+    ))
     quality_solver: cp_model.CpSolver | None = None
     quality_status: cp_model.CpSolverStatus | None = None
-    if (
-        new_quality_terms
-        and optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
-    ):
-        # Preserve every earlier optimization level. The baseline solution is
-        # always valid, so a timeout or UNKNOWN result can safely fall back to it.
-        model.Add(new_quality_objective <= quality_baseline_value)
+    if other_quality_terms and off_succeeded:
         model.ClearHints()
         for variable in x.values():
             model.AddHint(variable, quality_baseline_solver.Value(variable))
-        model.Minimize(new_quality_objective)
+        model.Minimize(other_quality_objective)
         quality_solver = cp_model.CpSolver()
         quality_solver.parameters.max_time_in_seconds = min(
             20, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 5)
@@ -1151,6 +1269,10 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             validation["hard_violations"],
             "VALIDATION_FAILED",
         )
+    quality_metrics = schedule_quality_metrics(
+        payload, schedule, workers, minimum_off
+    )
+    final_off_shortfall = int(round(active_solver.Value(total_off_shortfall)))
 
     return {
         "success": True,
@@ -1162,7 +1284,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         "staffing_summary": validation["staffing_summary"],
         "grade_summary": validation["grade_summary"],
         "individual_shift_counts": validation["individual_shift_counts"],
-        "off_shortfall_count": best_off_shortfall,
+        "off_shortfall_count": final_off_shortfall,
+        "quality_metrics": quality_metrics,
         "de_balance_summary": {
             "before_average_difference": balance_before["average_difference"],
             "after_average_difference": balance_after["average_difference"],
@@ -1176,7 +1299,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         },
         "soft_quality_summary": {
             "baseline_penalty": quality_baseline_value,
-            "final_penalty": int(round(active_solver.Value(new_quality_objective))),
+            "final_penalty": int(round(active_solver.Value(other_quality_objective))),
             "status": (
                 quality_solver.StatusName(quality_status)
                 if quality_solver is not None and quality_status is not None
@@ -1187,10 +1310,60 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 and quality_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
             ),
         },
+        "optimization_stages": {
+            "de_balance": {
+                "status": (
+                    balance_solver.StatusName(balance_status)
+                    if balance_solver is not None and balance_status is not None
+                    else "SKIPPED"
+                ),
+                "fallback_used": not balance_succeeded,
+            },
+            "work_off_repetition": {
+                "baseline_penalty": repetition_baseline_value,
+                "final_penalty": int(round(active_solver.Value(repetition_objective))),
+                "status": (
+                    repetition_solver.StatusName(repetition_status)
+                    if repetition_solver is not None and repetition_status is not None
+                    else "SKIPPED"
+                ),
+                "fallback_used": bool(
+                    repetition_solver is not None
+                    and repetition_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+                ),
+            },
+            "off_target_distribution": {
+                "baseline_penalty": off_baseline_value,
+                "final_penalty": int(round(active_solver.Value(off_objective))),
+                "status": (
+                    off_solver.StatusName(off_status)
+                    if off_solver is not None and off_status is not None
+                    else "SKIPPED"
+                ),
+                "fallback_used": bool(
+                    off_solver is not None
+                    and off_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+                ),
+            },
+            "other_preferences": {
+                "baseline_penalty": quality_baseline_value,
+                "final_penalty": int(round(active_solver.Value(other_quality_objective))),
+                "status": (
+                    quality_solver.StatusName(quality_status)
+                    if quality_solver is not None and quality_status is not None
+                    else "SKIPPED"
+                ),
+                "fallback_used": bool(
+                    quality_solver is not None
+                    and quality_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+                ),
+            },
+        },
         "solver_seconds": round(
             solver.WallTime()
-            + (optimizer.WallTime() if optimizer is not None else 0)
             + (balance_solver.WallTime() if balance_solver is not None else 0)
+            + (repetition_solver.WallTime() if repetition_solver is not None else 0)
+            + (off_solver.WallTime() if off_solver is not None else 0)
             + (quality_solver.WallTime() if quality_solver is not None else 0),
             3,
         ),
