@@ -96,6 +96,7 @@ def requested_off(payload: SolveRequest, worker_ids: set[str], num_days: int) ->
                 "type": "daily_off_request_limit",
                 "day": day,
                 "actual": len(ids),
+                "warning_only": True,
                 "required": "3 이하",
                 "message": f"{day}일 확정 희망 OFF가 {len(ids)}명으로 하루 최대 3명을 초과합니다.",
             })
@@ -135,6 +136,7 @@ def requested_assignments(
                 "nurseId": nurse_id,
                 "day": day,
                 "actual": f"{existing}, {shift}",
+                "warning_only": True,
                 "required": "하루에 하나의 근무 신청",
                 "message": f"{day}일에 {existing}와 {shift} 신청이 동시에 존재합니다.",
             })
@@ -342,9 +344,7 @@ def solve_night_plan(
         for day in range(1, num_days + 1):
             night[nurse_id, day] = model.NewBoolVar(f"night_{nurse_id}_{day}")
             requested = shift_requests.get((nurse_id, day))
-            if requested == "N":
-                model.Add(night[nurse_id, day] == 1)
-            elif requested in {"D", "E", "OFF"} or boundaries[nurse_id][0].get(day) == "OFF":
+            if boundaries[nurse_id][0].get(day) == "OFF":
                 model.Add(night[nurse_id, day] == 0)
         for day in previous_night_cooldown_days(payload, nurse, num_days):
             model.Add(night[nurse_id, day] == 0)
@@ -485,6 +485,264 @@ def scheduling_capacity_reasons(
             "off_target": minimum_off,
         },
     ))
+    return reasons
+
+
+def max_night_days_with_spacing(num_days: int) -> int:
+    """Optimistic monthly N capacity for one nurse with 3N + 4 non-N cycles."""
+    day = 1
+    total = 0
+    while day <= num_days:
+        block_len = min(3, num_days - day + 1)
+        total += block_len
+        day += block_len + 4
+    return total
+
+
+def enhanced_scheduling_capacity_reasons(
+    payload: SolveRequest,
+    workers: list[dict[str, Any]],
+    num_days: int,
+    minimum: dict[str, int],
+    minimum_off: int,
+    off_requests: set[tuple[str, int]],
+) -> list[dict[str, Any]]:
+    grades = Counter(role_group(n.get("role")) for n in workers)
+    worker_by_id = {str(n["id"]): n for n in workers}
+    off_by_day: dict[int, set[str]] = defaultdict(set)
+    off_by_day_grade: dict[int, Counter[str]] = defaultdict(Counter)
+    requested_by_grade = Counter()
+    cooldown_by_day: dict[int, set[str]] = defaultdict(set)
+    fixed_by_day: dict[int, dict[str, str]] = defaultdict(dict)
+
+    for nurse_id, day in off_requests:
+        nurse = worker_by_id.get(nurse_id)
+        if not nurse:
+            continue
+        off_by_day[day].add(nurse_id)
+        grade = role_group(nurse.get("role"))
+        off_by_day_grade[day][grade] += 1
+        requested_by_grade[grade] += 1
+
+    for nurse in workers:
+        nurse_id = str(nurse["id"])
+        fixed, _previous_evening, _previous_nights = previous_boundary(
+            payload, nurse, num_days
+        )
+        for day, shift in fixed.items():
+            fixed_by_day[day][nurse_id] = shift
+        for day in previous_night_cooldown_days(payload, nurse, num_days):
+            cooldown_by_day[day].add(nurse_id)
+
+    def ceil_div(left: int, right: int) -> int:
+        return 0 if right <= 0 else -(-left // right)
+
+    worker_count = len(workers)
+    total_minimum_staff = sum(minimum.values())
+    total_night_required = minimum["N"] * num_days
+    target_low = total_night_required // worker_count if worker_count else 0
+    target_high = ceil_div(total_night_required, worker_count) if worker_count else 0
+    theoretical_night_capacity = worker_count * target_high
+    spacing_capacity_per_worker = max_night_days_with_spacing(num_days)
+    spacing_capacity_total = worker_count * spacing_capacity_per_worker
+    minimum_workers_by_target = ceil_div(total_night_required, max(1, target_high))
+    minimum_workers_by_spacing = ceil_div(total_night_required, max(1, spacing_capacity_per_worker))
+    exact_work_slots = worker_count * max(0, num_days - minimum_off)
+    relaxed_work_slots = exact_work_slots + (worker_count if minimum_off > 0 else 0)
+    required_work_slots = num_days * total_minimum_staff
+
+    reasons: list[dict[str, Any]] = [
+        {
+            "type": "night_capacity_summary",
+            "severity": "critical",
+            "message": (
+                "현재 조건으로는 Night 배치가 가장 큰 병목일 가능성이 높습니다. "
+                f"Night 최소 {minimum['N']}명 × {num_days}일 = 총 {total_night_required}명분이 필요하고, "
+                f"Night 가능 3교대 인원은 {worker_count}명입니다. "
+                "Night 2~3연속, Night 후 OFF 2일, Night 종료 후 4일 재배정 금지를 함께 적용하면 "
+                "단순 총량보다 실제 배치 가능성이 크게 줄어듭니다."
+            ),
+            "night_min_per_day": minimum["N"],
+            "days": num_days,
+            "night_required_total": total_night_required,
+            "night_available_workers": worker_count,
+            "even_distribution_target_range": f"{target_low}~{target_high}",
+            "theoretical_night_capacity_at_high_target": theoretical_night_capacity,
+            "optimistic_capacity_with_3n_4non_n_cycles": spacing_capacity_total,
+            "optimistic_capacity_per_worker_with_spacing": spacing_capacity_per_worker,
+            "estimated_minimum_workers_by_monthly_target": minimum_workers_by_target,
+            "estimated_minimum_workers_by_spacing_only": minimum_workers_by_spacing,
+            "suggested_actions": [
+                "N 최소 인원을 낮출 수 있는지 확인",
+                "Night 가능 인원을 늘릴 수 있는지 확인",
+                "Night 종료 후 4일 재배정 금지를 권장조건으로 완화할 수 있는지 확인",
+                "이전달 마지막 주 Night/OFF 경계 조건이 과도하게 막고 있는지 확인",
+            ],
+        },
+        {
+            "type": "work_off_capacity_summary",
+            "severity": "critical" if relaxed_work_slots < required_work_slots else "info",
+            "message": (
+                f"전체 최소 근무 필요량은 D/E/N 최소 인원 합계 {total_minimum_staff}명 × {num_days}일 = "
+                f"{required_work_slots}명분입니다. OFF 목표 {minimum_off}개를 적용하면 정확 기준 근무 가능량은 "
+                f"{exact_work_slots}명분이고, OFF를 1개 부족하게 허용해도 최대 {relaxed_work_slots}명분입니다."
+            ),
+            "required_work_slots_from_daily_minimum": required_work_slots,
+            "available_work_slots_with_exact_off": exact_work_slots,
+            "available_work_slots_with_one_less_off": relaxed_work_slots,
+            "off_target": minimum_off,
+            "suggested_actions": [
+                "D/E/N 최소 인원 합계를 낮출 수 있는지 확인",
+                "OFF 목표를 현실적으로 조정할 수 있는지 확인",
+                "3교대 가능 인원을 늘릴 수 있는지 확인",
+            ],
+        },
+    ]
+
+    for grade in ("charge", "middle"):
+        grade_count = grades[grade]
+        grade_capacity_at_high_target = grade_count * target_high
+        reasons.append({
+            "type": f"night_{grade}_capacity",
+            "severity": "critical" if grade_capacity_at_high_target < num_days else "warning",
+            "message": (
+                f"Night마다 {grade} 최소 1명이 필요하므로 한 달 {num_days}일 동안 "
+                f"{grade} Night가 최소 {num_days}명분 필요합니다. 현재 {grade} 인원은 {grade_count}명이고, "
+                f"Night 균등 목표 상한 {target_high}개 기준 이론상 {grade_capacity_at_high_target}명분을 감당할 수 있습니다. "
+                "다만 2~3연속 Night 블록과 Night 후 4일 재배정 금지 때문에 특정 날짜에 배치가 끊길 수 있습니다."
+            ),
+            "grade": grade,
+            "available_workers": grade_count,
+            "required_night_assignments": num_days,
+            "estimated_monthly_target_high": target_high,
+            "theoretical_grade_night_capacity": grade_capacity_at_high_target,
+            "minimum_grade_workers_by_target": ceil_div(num_days, max(1, target_high)),
+            "confirmed_off_requests": requested_by_grade[grade],
+            "suggested_actions": [
+                f"{grade} Night 가능 인원을 늘릴 수 있는지 확인",
+                f"{grade}의 확정 OFF가 Night 필요 날짜에 몰려 있는지 확인",
+                "Night charge/middle 최소 1명 조건을 완화할 수 있는지 검토",
+            ],
+        })
+
+    daily_shortages: list[dict[str, Any]] = []
+    for day in range(1, num_days + 1):
+        off_ids = off_by_day.get(day, set())
+        available_total = worker_count - len(off_ids)
+        if available_total < total_minimum_staff:
+            daily_shortages.append({
+                "day": day,
+                "type": "daily_total_staff_after_confirmed_off",
+                "available": available_total,
+                "required": total_minimum_staff,
+                "confirmed_off_count": len(off_ids),
+            })
+        for grade in ("charge", "middle"):
+            available_grade = grades[grade] - off_by_day_grade.get(day, Counter())[grade]
+            if available_grade < 3:
+                daily_shortages.append({
+                    "day": day,
+                    "type": f"daily_{grade}_staff_after_confirmed_off",
+                    "grade": grade,
+                    "available": available_grade,
+                    "required": 3,
+                    "confirmed_off_count": off_by_day_grade.get(day, Counter())[grade],
+                    "message": (
+                        f"{day}일 확정 OFF를 반영하면 {grade} 가능 인원이 {available_grade}명입니다. "
+                        "D/E/N 각각 최소 1명씩 배치하려면 같은 날 최소 3명이 필요합니다."
+                    ),
+                })
+
+    night_day_shortages: list[dict[str, Any]] = []
+    for day in range(1, num_days + 1):
+        eligible_ids = []
+        eligible_by_grade = Counter()
+        fixed_night_count = 0
+        for nurse in workers:
+            nurse_id = str(nurse["id"])
+            fixed_shift = fixed_by_day.get(day, {}).get(nurse_id)
+            if fixed_shift == "N":
+                fixed_night_count += 1
+            if nurse_id in off_by_day.get(day, set()):
+                continue
+            if nurse_id in cooldown_by_day.get(day, set()):
+                continue
+            if fixed_shift and fixed_shift != "N":
+                continue
+            eligible_ids.append(nurse_id)
+            eligible_by_grade[role_group(nurse.get("role"))] += 1
+        if len(eligible_ids) < minimum["N"]:
+            night_day_shortages.append({
+                "day": day,
+                "type": "night_eligible_staff_shortage",
+                "eligible": len(eligible_ids),
+                "required": minimum["N"],
+                "fixed_night_from_previous_month": fixed_night_count,
+                "confirmed_off_count": len(off_by_day.get(day, set())),
+                "cooldown_blocked_count": len(cooldown_by_day.get(day, set())),
+            })
+        for grade in ("charge", "middle"):
+            if eligible_by_grade[grade] < 1:
+                night_day_shortages.append({
+                    "day": day,
+                    "type": f"night_{grade}_eligible_shortage",
+                    "grade": grade,
+                    "eligible": eligible_by_grade[grade],
+                    "required": 1,
+                    "confirmed_off_count": off_by_day_grade.get(day, Counter())[grade],
+                    "cooldown_blocked_count": sum(
+                        1
+                        for nurse_id in cooldown_by_day.get(day, set())
+                        if role_group(worker_by_id.get(nurse_id, {}).get("role")) == grade
+                    ),
+                })
+
+    if daily_shortages:
+        reasons.append({
+            "type": "confirmed_off_daily_staffing_shortages",
+            "severity": "critical",
+            "message": "확정 희망 OFF를 반영하면 특정 날짜의 전체 인원 또는 직급 인원이 부족해질 수 있습니다.",
+            "shortages": daily_shortages[:20],
+            "omitted_count": max(0, len(daily_shortages) - 20),
+            "suggested_actions": [
+                "해당 날짜의 확정 OFF 일부를 조정",
+                "해당 날짜 D/E/N 최소 인원을 낮출 수 있는지 확인",
+                "부족한 직급 인원을 보강",
+            ],
+        })
+
+    if night_day_shortages:
+        reasons.append({
+            "type": "night_daily_eligibility_shortages",
+            "severity": "critical",
+            "message": (
+                "확정 OFF, 이전달 Night 경계, Night 후 4일 재배정 금지를 반영하면 "
+                "특정 날짜에 Night 가능 인원 또는 Night 직급 인원이 부족해질 수 있습니다."
+            ),
+            "shortages": night_day_shortages[:20],
+            "omitted_count": max(0, len(night_day_shortages) - 20),
+            "suggested_actions": [
+                "해당 날짜 전후의 Night 확정/이전달 근무표를 확인",
+                "Night 후 4일 재배정 금지를 권장조건으로 낮출 수 있는지 검토",
+                "N 최소 인원을 낮추거나 Night 가능 인원을 보강",
+            ],
+        })
+
+    reasons.append({
+        "type": "recommended_relaxation_order",
+        "severity": "info",
+        "message": (
+            "해를 찾지 못했다면 먼저 N 최소 인원, Night 가능 인원, Night 후 4일 재배정 금지, "
+            "Night charge/middle 최소 조건, OFF 목표 순서로 완화 가능성을 검토하세요."
+        ),
+        "recommended_order": [
+            "N 최소 인원 낮추기",
+            "Night 가능 인원 늘리기",
+            "Night 후 4일 재배정 금지를 권장조건으로 완화",
+            "Night charge/middle 최소 조건 완화 또는 해당 직급 보강",
+            "OFF 목표 또는 확정 OFF 조정",
+        ],
+    })
     return reasons
 
 
@@ -645,19 +903,25 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             len(workers), num_days, minimum_off, minimum, maximum
         )
     except ValueError as error:
+        early_off_requests, _early_off_conflicts = requested_off(
+            payload, worker_ids, num_days
+        )
         return infeasible_response(
             "현재 인원·OFF·최소인원·최대인원 조건을 동시에 만족할 수 없습니다.",
-            [{"type": "staffing_capacity", "message": str(error)}],
+            [{"type": "staffing_capacity", "message": str(error)}]
+            + enhanced_scheduling_capacity_reasons(
+                payload, workers, num_days, minimum, minimum_off, early_off_requests
+            ),
             "PRECHECK_FAILED",
         )
     off_requests, off_request_conflicts = requested_off(payload, worker_ids, num_days)
     shift_requests, shift_request_conflicts = requested_assignments(
         payload, worker_ids, num_days
     )
-    request_conflicts = (
-        off_request_conflicts
-        + shift_request_conflicts
-        + request_boundary_conflicts(payload, workers, shift_requests, num_days)
+    request_conflicts = off_request_conflicts + shift_request_conflicts
+    request_conflicts.extend(
+        {**item, "warning_only": True}
+        for item in request_boundary_conflicts(payload, workers, shift_requests, num_days)
     )
     precheck_hard, precheck_warnings = precheck(
         payload, workers, num_days, minimum, maximum, minimum_off, request_conflicts
@@ -665,7 +929,10 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     if precheck_hard:
         return infeasible_response(
             "현재 인원·OFF·최소인원·Grade 조건을 동시에 만족할 수 없습니다.",
-            precheck_hard,
+            precheck_hard
+            + enhanced_scheduling_capacity_reasons(
+                payload, workers, num_days, minimum, minimum_off, off_requests
+            ),
             "PRECHECK_FAILED",
         )
     night_plan, night_status = solve_night_plan(
@@ -678,7 +945,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 "type": "night_plan_infeasible",
                 "message": "Night 선행 배치 단계에서 조건을 만족하는 해를 찾지 못했습니다.",
                 "solver_status": night_status,
-            }] + scheduling_capacity_reasons(
+            }] + enhanced_scheduling_capacity_reasons(
                 payload, workers, num_days, minimum, minimum_off, off_requests
             ),
             night_status,
@@ -702,9 +969,6 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             fixed_shift = boundaries[nurse_id][0].get(day)
             if fixed_shift:
                 model.Add(x[nurse_id, day, fixed_shift] == 1)
-            requested_shift = shift_requests.get((nurse_id, day))
-            if requested_shift:
-                model.Add(x[nurse_id, day, requested_shift] == 1)
         if boundaries[nurse_id][1]:
             model.Add(x[nurse_id, 1, "D"] == 0)
 
@@ -727,6 +991,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
 
     general_night_totals: list[cp_model.IntVar] = []
     objective_terms: list[cp_model.LinearExpr] = []
+    request_unmet_terms: list[cp_model.LinearExpr] = []
     de_extreme_terms: list[cp_model.LinearExpr] = []
     de_shortfall_terms: list[cp_model.LinearExpr] = []
     de_excess_terms: list[cp_model.LinearExpr] = []
@@ -753,6 +1018,10 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         nurse_id = str(nurse["id"])
         name = nurse_name(nurse)
         previous_row = previous_shifts(payload, nurse)
+        for day in range(1, num_days + 1):
+            requested_shift = shift_requests.get((nurse_id, day))
+            if requested_shift:
+                request_unmet_terms.append(1 - x[nurse_id, day, requested_shift])
 
         def shift_expr(day: int, shift: str) -> cp_model.LinearExpr | int | None:
             if day >= 1:
@@ -1090,6 +1359,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             ))
 
     objective = sum(objective_terms)
+    request_objective = sum(request_unmet_terms)
     de_balance_objective = (
         sum(de_extreme_terms) * 10_000_000_000
         + sum(de_shortfall_terms) * 10_000_000
@@ -1140,7 +1410,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 "type": "constraint_combination_conflict",
                 "message": "OFF, 일별 인원, Grade, Night 블록 및 휴식 조건의 조합에서 해를 찾지 못했습니다.",
                 "solver_status": solver.StatusName(status),
-            }] + scheduling_capacity_reasons(
+            }] + enhanced_scheduling_capacity_reasons(
                 payload, workers, num_days, minimum, minimum_off, off_requests
             ),
             solver.StatusName(status),
@@ -1148,11 +1418,34 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
 
     active_solver = solver
     active_status = status
-    balance_baseline_solver = solver
+    request_solver: cp_model.CpSolver | None = None
+    request_status: cp_model.CpSolverStatus | None = None
+    request_succeeded = not request_unmet_terms
+    request_baseline_value = int(round(active_solver.Value(request_objective)))
+    if request_unmet_terms:
+        model.ClearHints()
+        for variable in x.values():
+            model.AddHint(variable, active_solver.Value(variable))
+        model.Minimize(request_objective)
+        request_solver = cp_model.CpSolver()
+        request_solver.parameters.max_time_in_seconds = min(
+            15, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 6)
+        )
+        request_solver.parameters.num_search_workers = 8
+        request_solver.parameters.random_seed = 202607
+        request_status = request_solver.Solve(model)
+        if request_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            active_solver = request_solver
+            active_status = request_status
+            request_succeeded = True
+            best_request = int(round(request_solver.Value(request_objective)))
+            model.Add(request_objective <= best_request)
+
+    balance_baseline_solver = active_solver
     balance_solver: cp_model.CpSolver | None = None
     balance_status: cp_model.CpSolverStatus | None = None
     balance_succeeded = False
-    if de_balance_vars:
+    if de_balance_vars and request_succeeded:
         model.ClearHints()
         for variable in x.values():
             model.AddHint(variable, balance_baseline_solver.Value(variable))
@@ -1316,6 +1609,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         "message": "근무표가 생성되었습니다.",
         "hard_violations": [],
         "warnings": precheck_warnings + validation["warnings"],
+        "unmet_requests": validation["unmet_requests"],
         "validation": validation,
         "staffing_summary": validation["staffing_summary"],
         "grade_summary": validation["grade_summary"],
@@ -1347,6 +1641,19 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             ),
         },
         "optimization_stages": {
+            "shift_requests": {
+                "baseline_unmet": request_baseline_value,
+                "final_unmet": int(round(active_solver.Value(request_objective))),
+                "status": (
+                    request_solver.StatusName(request_status)
+                    if request_solver is not None and request_status is not None
+                    else "NO_REQUESTS"
+                ),
+                "fallback_used": bool(
+                    request_solver is not None
+                    and request_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+                ),
+            },
             "de_balance": {
                 "status": (
                     balance_solver.StatusName(balance_status)
@@ -1414,6 +1721,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         },
         "solver_seconds": round(
             solver.WallTime()
+            + (request_solver.WallTime() if request_solver is not None else 0)
             + (balance_solver.WallTime() if balance_solver is not None else 0)
             + (repetition_solver.WallTime() if repetition_solver is not None else 0)
             + (single_shift_solver.WallTime() if single_shift_solver is not None else 0)
@@ -1440,6 +1748,7 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
     request_conflicts = off_request_conflicts + shift_request_conflicts
     hard: list[dict[str, Any]] = []
     warnings = [item for item in request_conflicts if item.get("warning_only")]
+    unmet_requests: list[dict[str, Any]] = []
     staffing_summary: list[dict[str, Any]] = []
     grade_summary: list[dict[str, Any]] = []
     counts_summary: list[dict[str, Any]] = []
@@ -1716,17 +2025,20 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
     for (nurse_id, day), requested_shift in shift_requests.items():
         row = schedule.get(nurse_id, [])
         if len(row) >= day and row[day - 1] != requested_shift:
-            violation(
-                "confirmed_shift_request_unmet",
-                (
-                    f"{names[nurse_id]} {day}일 확정 희망 {requested_shift}가 "
-                    f"반영되지 않았습니다."
+            item = {
+                "type": "shift_request_unmet",
+                "message": (
+                    f"{names[nurse_id]} {day}일 신청 {requested_shift}가 "
+                    "절대조건과 충돌하여 반영되지 않았습니다."
                 ),
-                nurseId=nurse_id,
-                day=day,
-                actual=row[day - 1],
-                required=requested_shift,
-            )
+                "nurseId": nurse_id,
+                "day": day,
+                "actual": row[day - 1],
+                "required": requested_shift,
+                "warning_only": True,
+            }
+            unmet_requests.append(item)
+            warnings.append(item)
 
     for day in range(1, num_days + 1):
         for shift in WORK_SHIFTS:
@@ -1772,6 +2084,7 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
     return {
         "hard_violations": hard,
         "warnings": warnings,
+        "unmet_requests": unmet_requests,
         "staffing_summary": staffing_summary,
         "grade_summary": grade_summary,
         "individual_shift_counts": counts_summary,
