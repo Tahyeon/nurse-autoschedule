@@ -303,6 +303,12 @@ def previous_night_cooldown_days(
     nurse: dict[str, Any],
     num_days: int,
 ) -> list[int]:
+    # The 4-day Night re-assignment cooldown is a quality preference, not a
+    # hard rule. Keeping it hard made realistic ICU staffing inputs infeasible
+    # when previous-month boundary data was uploaded. The hard recovery rule is
+    # still handled by previous_boundary(): trailing Night blocks must continue
+    # if needed and then receive two OFF days.
+    return []
     row = previous_shifts(payload, nurse)
     if not row or "N" not in row:
         return []
@@ -365,7 +371,7 @@ def solve_night_plan(
                 employee_blocks.append(block)
                 for day in range(start, start + length):
                     coverage[day].append(block)
-                for recovery_day in range(start + length, start + length + 4):
+                for recovery_day in (start + length, start + length + 1):
                     if recovery_day <= num_days:
                         model.Add(night[nurse_id, recovery_day] == 0).OnlyEnforceIf(block)
 
@@ -478,8 +484,8 @@ def scheduling_capacity_reasons(
     reasons.extend((
         {
             "type": "night_cooldown_capacity",
-            "message": "각 Night 블록 종료 후 4일 동안 Night 재배정 금지 조건과 날짜별 Night 필요 인원이 충돌할 수 있습니다.",
-            "required": "Night 종료 후 4일간 N 금지",
+            "message": "각 Night 블록 종료 후 OFF 2일 조건과 날짜별 Night 필요 인원이 충돌할 수 있습니다.",
+            "required": "Night 종료 후 OFF 2일",
         },
         {
             "type": "consecutive_work_capacity",
@@ -492,13 +498,13 @@ def scheduling_capacity_reasons(
 
 
 def max_night_days_with_spacing(num_days: int) -> int:
-    """Optimistic monthly N capacity for one nurse with 3N + 4 non-N cycles."""
+    """Optimistic monthly N capacity for one nurse with 3N + 2 OFF cycles."""
     day = 1
     total = 0
     while day <= num_days:
         block_len = min(3, num_days - day + 1)
         total += block_len
-        day += block_len + 4
+        day += block_len + 2
     return total
 
 
@@ -562,7 +568,7 @@ def enhanced_scheduling_capacity_reasons(
                 "현재 조건으로는 Night 배치가 가장 큰 병목일 가능성이 높습니다. "
                 f"Night 최소 {minimum['N']}명 × {num_days}일 = 총 {total_night_required}명분이 필요하고, "
                 f"Night 가능 3교대 인원은 {worker_count}명입니다. "
-                "Night 2~3연속, Night 후 OFF 2일, Night 종료 후 4일 재배정 금지를 함께 적용하면 "
+                "Night 2~3연속과 Night 후 OFF 2일을 함께 적용하면 "
                 "단순 총량보다 실제 배치 가능성이 크게 줄어듭니다."
             ),
             "night_min_per_day": minimum["N"],
@@ -578,7 +584,7 @@ def enhanced_scheduling_capacity_reasons(
             "suggested_actions": [
                 "N 최소 인원을 낮출 수 있는지 확인",
                 "Night 가능 인원을 늘릴 수 있는지 확인",
-                "Night 종료 후 4일 재배정 금지를 권장조건으로 완화할 수 있는지 확인",
+                "N 최소 인원을 낮추거나 Night 가능 인원을 늘릴 수 있는지 확인",
                 "이전달 마지막 주 Night/OFF 경계 조건이 과도하게 막고 있는지 확인",
             ],
         },
@@ -612,7 +618,7 @@ def enhanced_scheduling_capacity_reasons(
                 f"Night마다 {grade} 최소 1명이 필요하므로 한 달 {num_days}일 동안 "
                 f"{grade} Night가 최소 {num_days}명분 필요합니다. 현재 {grade} 인원은 {grade_count}명이고, "
                 f"Night 균등 목표 상한 {target_high}개 기준 이론상 {grade_capacity_at_high_target}명분을 감당할 수 있습니다. "
-                "다만 2~3연속 Night 블록과 Night 후 4일 재배정 금지 때문에 특정 날짜에 배치가 끊길 수 있습니다."
+                "다만 2~3연속 Night 블록과 Night 후 OFF 2일 때문에 특정 날짜에 배치가 끊길 수 있습니다."
             ),
             "grade": grade,
             "available_workers": grade_count,
@@ -719,14 +725,14 @@ def enhanced_scheduling_capacity_reasons(
             "type": "night_daily_eligibility_shortages",
             "severity": "critical",
             "message": (
-                "확정 OFF, 이전달 Night 경계, Night 후 4일 재배정 금지를 반영하면 "
+                "확정 OFF, 이전달 Night 경계, Night 후 OFF 2일을 반영하면 "
                 "특정 날짜에 Night 가능 인원 또는 Night 직급 인원이 부족해질 수 있습니다."
             ),
             "shortages": night_day_shortages[:20],
             "omitted_count": max(0, len(night_day_shortages) - 20),
             "suggested_actions": [
                 "해당 날짜 전후의 Night 확정/이전달 근무표를 확인",
-                "Night 후 4일 재배정 금지를 권장조건으로 낮출 수 있는지 검토",
+                "N 최소 인원을 낮추거나 Night 가능 인원을 늘릴 수 있는지 검토",
                 "N 최소 인원을 낮추거나 Night 가능 인원을 보강",
             ],
         })
@@ -735,13 +741,13 @@ def enhanced_scheduling_capacity_reasons(
         "type": "recommended_relaxation_order",
         "severity": "info",
         "message": (
-            "해를 찾지 못했다면 먼저 N 최소 인원, Night 가능 인원, Night 후 4일 재배정 금지, "
+            "해를 찾지 못했다면 먼저 N 최소 인원, Night 가능 인원, Night 후 OFF 2일, "
             "Night charge/middle 최소 조건, OFF 목표 순서로 완화 가능성을 검토하세요."
         ),
         "recommended_order": [
             "N 최소 인원 낮추기",
             "Night 가능 인원 늘리기",
-            "Night 후 4일 재배정 금지를 권장조건으로 완화",
+            "N 최소 인원 조정 또는 Night 가능 인원 보강",
             "Night charge/middle 최소 조건 완화 또는 해당 직급 보강",
             "OFF 목표 또는 확정 OFF 조정",
         ],
@@ -942,7 +948,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     )
     if not night_plan:
         return infeasible_response(
-            "Night 가능 인원·연속 블록·종료 후 4일 재배정 금지·Grade 조건을 동시에 만족할 수 없습니다.",
+            "Night 가능 인원·연속 블록·종료 후 OFF 2일·Grade 조건을 동시에 만족할 수 없습니다.",
             [{
                 "type": "night_plan_infeasible",
                 "message": "Night 선행 배치 단계에서 조건을 만족하는 해를 찾지 못했습니다.",
@@ -1268,9 +1274,6 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 for recovery_day in (start + length, start + length + 1):
                     if recovery_day <= num_days:
                         model.Add(x[nurse_id, recovery_day, "OFF"] == 1).OnlyEnforceIf(block)
-                for cooldown_day in range(start + length, start + length + 4):
-                    if cooldown_day <= num_days:
-                        model.Add(x[nurse_id, cooldown_day, "N"] == 0).OnlyEnforceIf(block)
 
         for day in range(1, num_days + 1):
             if boundaries[nurse_id][0].get(day) == "N":
@@ -2005,7 +2008,10 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                     required="OFF/OFF",
                     boundary=bool(start == 0 and previous_night_run),
                 )
-            cooldown = row[index:min(index + 4, num_days)]
+            # The extra 4-day Night cooldown is no longer a hard validation
+            # rule. The mandatory post-Night recovery remains the two OFF days
+            # checked just above.
+            cooldown: list[str] = []
             next_night_offset = next(
                 (offset for offset, value in enumerate(cooldown) if value == "N"),
                 None,
