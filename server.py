@@ -36,6 +36,9 @@ class SolveRequest(BaseModel):
     nurses: list[dict[str, Any]]
     requests: list[dict[str, Any]] = Field(default_factory=list)
     previousSchedule: dict[str, list[str]] = Field(default_factory=dict)
+    previousBoundaryMode: str | None = None
+    previousReflectionMode: str | None = None
+    terminationDays: dict[str, int] = Field(default_factory=dict)
     needs: dict[str, int] = Field(default_factory=dict)
     maxNeeds: dict[str, int] = Field(default_factory=dict)
     required_off: int | None = None
@@ -74,6 +77,68 @@ def normalize_shift(value: Any) -> str:
     if shift in {"O", "OF", "OFF"}:
         return "OFF"
     return shift
+
+
+def previous_boundary_mode(payload: SolveRequest) -> str:
+    raw = str(
+        payload.previousBoundaryMode
+        or payload.previousReflectionMode
+        or "basic"
+    ).strip().lower()
+    if raw in {"strong", "hard", "strict", "강하게", "강함"}:
+        return "strong"
+    if raw in {"weak", "soft", "light", "약하게", "약함"}:
+        return "weak"
+    return "basic"
+
+
+def nurse_end_day(payload: SolveRequest, nurse: dict[str, Any], num_days: int) -> int:
+    raw = payload.terminationDays.get(str(nurse.get("id")))
+    try:
+        day = int(raw)
+    except (TypeError, ValueError):
+        return num_days
+    return max(1, min(num_days, day))
+
+
+def nurse_active_off_target(
+    payload: SolveRequest,
+    nurse: dict[str, Any],
+    num_days: int,
+    minimum_off: int,
+) -> int:
+    end_day = nurse_end_day(payload, nurse, num_days)
+    if end_day >= num_days:
+        return min(minimum_off, num_days)
+    prorated = round(minimum_off * end_day / max(1, num_days))
+    return max(0, min(end_day, prorated))
+
+
+def concise_reasons(reasons: list[dict[str, Any]], limit: int = 4) -> list[dict[str, Any]]:
+    preferred = (
+        "night_plan_infeasible",
+        "night_daily_eligibility_shortages",
+        "confirmed_off_daily_staffing_shortages",
+        "work_off_capacity_summary",
+        "night_capacity_summary",
+        "required_off_capacity",
+        "daily_staffing_capacity",
+        "constraint_combination_conflict",
+    )
+    selected: list[dict[str, Any]] = []
+    for kind in preferred:
+        for item in reasons:
+            if item.get("type") == kind and item not in selected:
+                selected.append(item)
+                break
+        if len(selected) >= limit:
+            break
+    for item in reasons:
+        if len(selected) >= limit:
+            break
+        if item not in selected:
+            selected.append(item)
+    return selected[:limit]
 
 
 def requested_off(payload: SolveRequest, worker_ids: set[str], num_days: int) -> tuple[set[tuple[str, int]], list[dict[str, Any]]]:
@@ -270,6 +335,8 @@ def previous_boundary(
     row = previous_shifts(payload, nurse)
     if not row:
         return {}, False, 0
+    if previous_boundary_mode(payload) == "weak":
+        return {}, False, 0
 
     previous_ends_evening = row[-1] == "E"
     trailing_nights = 0
@@ -348,8 +415,11 @@ def solve_night_plan(
 
     for nurse in workers:
         nurse_id = str(nurse["id"])
+        end_day = nurse_end_day(payload, nurse, num_days)
         for day in range(1, num_days + 1):
             night[nurse_id, day] = model.NewBoolVar(f"night_{nurse_id}_{day}")
+            if day > end_day:
+                model.Add(night[nurse_id, day] == 0)
             requested = shift_requests.get((nurse_id, day))
             if requested == "OFF":
                 model.Add(night[nurse_id, day] == 0)
@@ -411,10 +481,17 @@ def solve_night_plan(
     general_required = sum(day["N"] for day in daily_targets) - hye_total
     if general_workers:
         floor_target, high_count = divmod(general_required, len(general_workers))
+        general_total_exprs = []
         for index, nurse in enumerate(general_workers):
             nurse_id = str(nurse["id"])
             target = floor_target + (1 if index < high_count else 0)
-            model.Add(sum(night[nurse_id, day] for day in range(1, num_days + 1)) == target)
+            total_nights = sum(night[nurse_id, day] for day in range(1, num_days + 1))
+            general_total_exprs.append(total_nights)
+            end_day = nurse_end_day(payload, nurse, num_days)
+            model.Add(total_nights <= target + 1)
+            if end_day >= num_days:
+                model.Add(total_nights >= max(0, target - 1))
+        model.Add(sum(general_total_exprs) == general_required)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = min(60, max(20, payload.timeLimitSeconds // 2))
@@ -432,15 +509,35 @@ def solve_night_plan(
 
 
 def infeasible_response(message: str, reasons: list[dict[str, Any]], status: str = "INFEASIBLE") -> dict[str, Any]:
+    short_reasons = concise_reasons(reasons)
     return {
         "success": False,
         "schedule": [],
-        "message": message,
-        "infeasible_reasons": reasons,
-        "hard_violations": reasons,
+        "message": short_failure_message(message, short_reasons),
+        "infeasible_reasons": short_reasons,
+        "hard_violations": short_reasons,
+        "full_infeasible_reasons": reasons,
         "warnings": [],
         "status": status,
     }
+
+
+def short_failure_message(message: str, reasons: list[dict[str, Any]]) -> str:
+    labels = {
+        "night_plan_infeasible": "Night 배치 조건을 만족하지 못했습니다.",
+        "night_daily_eligibility_shortages": "특정 날짜의 Night 가능 인원이 부족합니다.",
+        "confirmed_off_daily_staffing_shortages": "확정 OFF 때문에 특정 날짜 인원이 부족합니다.",
+        "work_off_capacity_summary": "OFF 수와 일별 최소 인원을 동시에 맞추기 어렵습니다.",
+        "night_capacity_summary": "Night 총 필요량이 현재 조건에서 빡빡합니다.",
+        "required_off_capacity": "OFF 목표와 최소 근무 인원이 충돌합니다.",
+        "daily_staffing_capacity": "하루 최소 인원 합계가 3교대 인원보다 많습니다.",
+        "constraint_combination_conflict": "여러 필수조건 조합에서 해를 찾지 못했습니다.",
+    }
+    parts = [labels.get(str(item.get("type")), str(item.get("message") or item.get("type") or "")) for item in reasons[:3]]
+    parts = [part for part in parts if part]
+    if not parts:
+        return message
+    return "현재 조건으로 근무표를 만들 수 없습니다.\n원인: " + " / ".join(parts)
 
 
 def scheduling_capacity_reasons(
@@ -877,8 +974,9 @@ def precheck(
     for nurse in workers:
         trailing_work = previous_trailing_work_days(payload, nurse)
         if trailing_work > 5:
-            hard.append({
-                "type": "previous_consecutive_work_exceeds_limit",
+            warnings.append({
+                "type": "previous_consecutive_work_exceeds_preference",
+                "warning_only": True,
                 "nurseId": str(nurse["id"]),
                 "name": nurse_name(nurse),
                 "actual": trailing_work,
@@ -943,22 +1041,6 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             ),
             "PRECHECK_FAILED",
         )
-    night_plan, night_status = solve_night_plan(
-        payload, workers, num_days, daily_targets, shift_requests
-    )
-    if not night_plan:
-        return infeasible_response(
-            "Night 가능 인원·연속 블록·종료 후 OFF 2일·Grade 조건을 동시에 만족할 수 없습니다.",
-            [{
-                "type": "night_plan_infeasible",
-                "message": "Night 선행 배치 단계에서 조건을 만족하는 해를 찾지 못했습니다.",
-                "solver_status": night_status,
-            }] + enhanced_scheduling_capacity_reasons(
-                payload, workers, num_days, minimum, minimum_off, off_requests
-            ),
-            night_status,
-        )
-
     model = cp_model.CpModel()
     x: dict[tuple[str, int, str], cp_model.IntVar] = {}
     night_blocks: dict[tuple[str, int, int], cp_model.IntVar] = {}
@@ -969,13 +1051,15 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
 
     for nurse in workers:
         nurse_id = str(nurse["id"])
+        end_day = nurse_end_day(payload, nurse, num_days)
         for day in range(1, num_days + 1):
             for shift in SHIFTS:
                 x[nurse_id, day, shift] = model.NewBoolVar(f"x_{nurse_id}_{day}_{shift}")
             model.AddExactlyOne(x[nurse_id, day, shift] for shift in SHIFTS)
-            model.Add(x[nurse_id, day, "N"] == night_plan[nurse_id][day - 1])
+            if day > end_day:
+                model.Add(x[nurse_id, day, "OFF"] == 1)
             fixed_shift = boundaries[nurse_id][0].get(day)
-            if fixed_shift:
+            if fixed_shift and day <= end_day:
                 model.Add(x[nurse_id, day, fixed_shift] == 1)
         if boundaries[nurse_id][1]:
             model.Add(x[nurse_id, 1, "D"] == 0)
@@ -983,11 +1067,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     for day in range(1, num_days + 1):
         for shift in WORK_SHIFTS:
             assigned = [x[str(n["id"]), day, shift] for n in workers]
-            if shift == "N":
-                model.Add(sum(assigned) == daily_targets[day - 1][shift])
-            else:
-                model.Add(sum(assigned) >= minimum[shift])
-                model.Add(sum(assigned) <= maximum[shift])
+            model.Add(sum(assigned) >= minimum[shift])
+            model.Add(sum(assigned) <= maximum[shift])
             model.Add(sum(
                 x[str(n["id"]), day, shift]
                 for n in workers if role_group(n.get("role")) == "charge"
@@ -1026,6 +1107,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         nurse_id = str(nurse["id"])
         name = nurse_name(nurse)
         previous_row = previous_shifts(payload, nurse)
+        use_previous_quality = previous_boundary_mode(payload) == "strong"
         for day in range(1, num_days + 1):
             requested_shift = shift_requests.get((nurse_id, day))
             if requested_shift == "OFF":
@@ -1051,10 +1133,12 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             0, 1 if minimum_off > 0 else 0, f"off_shortfall_{nurse_id}"
         )
         off_shortfall_vars[nurse_id] = off_shortfall
+        end_day = nurse_end_day(payload, nurse, num_days)
+        active_off_target = nurse_active_off_target(payload, nurse, num_days, minimum_off)
         model.Add(
-            sum(x[nurse_id, day, "OFF"] for day in range(1, num_days + 1))
+            sum(x[nurse_id, day, "OFF"] for day in range(1, end_day + 1))
             + off_shortfall
-            == minimum_off
+            == active_off_target
         )
         for day in range(1, num_days):
             model.Add(x[nurse_id, day, "E"] + x[nurse_id, day + 1, "D"] <= 1)
@@ -1067,13 +1151,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 x[nurse_id, day, "OFF"]
                 for day in range(start, start + 6)
             ) >= 1)
-        trailing_work = previous_trailing_work_days(payload, nurse)
-        if 1 <= trailing_work <= 5:
-            boundary_days = min(num_days, 6 - trailing_work)
-            model.Add(sum(
-                x[nurse_id, day, "OFF"]
-                for day in range(1, boundary_days + 1)
-            ) >= 1)
+        # Previous-month consecutive work is now a boundary preference only.
+        # Month-internal six-day work prevention remains hard above.
 
         for day in previous_night_cooldown_days(payload, nurse, num_days):
             model.Add(x[nurse_id, day, "N"] == 0)
@@ -1081,7 +1160,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         # Prefer practical D/E runs without making them hard constraints.
         for shift in ("D", "E"):
             first_single = model.NewBoolVar(f"single_{shift}_{nurse_id}_1")
-            previous_same_shift = bool(previous_row and previous_row[-1] == shift)
+            previous_same_shift = bool(use_previous_quality and previous_row and previous_row[-1] == shift)
             if previous_same_shift:
                 model.Add(first_single == 0)
             else:
@@ -1132,22 +1211,23 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 model.Add(six_total <= 5).OnlyEnforceIf(six_same.Not())
                 objective_terms.append(six_same * 20)
 
-            previous_tail = previous_row[-5:]
-            for previous_count in range(1, len(previous_tail) + 1):
-                previous_segment = previous_tail[-previous_count:]
-                current_count = 6 - previous_count
-                if current_count > num_days or any(value != shift for value in previous_segment):
-                    continue
-                boundary_six_same = model.NewBoolVar(
-                    f"boundary_six_{shift}_{nurse_id}_{previous_count}"
-                )
-                current_total = sum(
-                    x[nurse_id, day, shift]
-                    for day in range(1, current_count + 1)
-                )
-                model.Add(current_total == current_count).OnlyEnforceIf(boundary_six_same)
-                model.Add(current_total <= current_count - 1).OnlyEnforceIf(boundary_six_same.Not())
-                objective_terms.append(boundary_six_same * 20)
+            if use_previous_quality:
+                previous_tail = previous_row[-5:]
+                for previous_count in range(1, len(previous_tail) + 1):
+                    previous_segment = previous_tail[-previous_count:]
+                    current_count = 6 - previous_count
+                    if current_count > num_days or any(value != shift for value in previous_segment):
+                        continue
+                    boundary_six_same = model.NewBoolVar(
+                        f"boundary_six_{shift}_{nurse_id}_{previous_count}"
+                    )
+                    current_total = sum(
+                        x[nurse_id, day, shift]
+                        for day in range(1, current_count + 1)
+                    )
+                    model.Add(current_total == current_count).OnlyEnforceIf(boundary_six_same)
+                    model.Add(current_total <= current_count - 1).OnlyEnforceIf(boundary_six_same.Not())
+                    objective_terms.append(boundary_six_same * 20)
 
         # Prefer an OFF before a sixth consecutive D/E/N workday.
         for start in range(1, num_days - 4):
@@ -1159,26 +1239,27 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             model.Add(off_total >= 1).OnlyEnforceIf(six_work.Not())
             objective_terms.append(six_work * 40)
 
-        previous_tail = previous_shifts(payload, nurse)[-5:]
-        for previous_count in range(1, len(previous_tail) + 1):
-            previous_segment = previous_tail[-previous_count:]
-            current_count = 6 - previous_count
-            if current_count > num_days or any(value == "OFF" for value in previous_segment):
-                continue
-            boundary_six_work = model.NewBoolVar(
-                f"boundary_six_work_{nurse_id}_{previous_count}"
-            )
-            current_work_total = sum(
-                1 - x[nurse_id, day, "OFF"]
-                for day in range(1, current_count + 1)
-            )
-            model.Add(current_work_total == current_count).OnlyEnforceIf(boundary_six_work)
-            model.Add(current_work_total <= current_count - 1).OnlyEnforceIf(boundary_six_work.Not())
-            objective_terms.append(boundary_six_work * 40)
+        if use_previous_quality:
+            previous_tail = previous_shifts(payload, nurse)[-5:]
+            for previous_count in range(1, len(previous_tail) + 1):
+                previous_segment = previous_tail[-previous_count:]
+                current_count = 6 - previous_count
+                if current_count > num_days or any(value == "OFF" for value in previous_segment):
+                    continue
+                boundary_six_work = model.NewBoolVar(
+                    f"boundary_six_work_{nurse_id}_{previous_count}"
+                )
+                current_work_total = sum(
+                    1 - x[nurse_id, day, "OFF"]
+                    for day in range(1, current_count + 1)
+                )
+                model.Add(current_work_total == current_count).OnlyEnforceIf(boundary_six_work)
+                model.Add(current_work_total <= current_count - 1).OnlyEnforceIf(boundary_six_work.Not())
+                objective_terms.append(boundary_six_work * 40)
 
         # Lowest-priority quality preferences. Every indicator only contributes
         # to the final objective and never restricts schedule feasibility.
-        first_combined_day = 1 - len(previous_row)
+        first_combined_day = 1 - len(previous_row) if use_previous_quality else 1
         for start in range(first_combined_day, num_days - 4):
             window = [work_expr(day) for day in range(start, start + 6)]
             if start + 5 < 1 or any(term is None for term in window):
@@ -1231,7 +1312,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                 repetition_terms,
             )
 
-        transition_start = 0 if previous_row else 1
+        transition_start = 0 if use_previous_quality and previous_row else 1
         for day in range(transition_start, num_days):
             day_shift = shift_expr(day, "D")
             next_night = shift_expr(day + 1, "N")
@@ -1244,7 +1325,7 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
                     other_quality_terms,
                 )
 
-        triple_start = -1 if len(previous_row) >= 2 else (0 if previous_row else 1)
+        triple_start = -1 if use_previous_quality and len(previous_row) >= 2 else (0 if use_previous_quality and previous_row else 1)
         for day in range(triple_start, num_days - 1):
             evening = shift_expr(day, "E")
             middle_off = shift_expr(day + 1, "OFF")
@@ -1292,7 +1373,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         else:
             total_var = model.NewIntVar(0, num_days, f"night_total_{nurse_id}")
             model.Add(total_var == night_total)
-            general_night_totals.append(total_var)
+            if nurse_end_day(payload, nurse, num_days) >= num_days:
+                general_night_totals.append(total_var)
 
         d_total = sum(x[nurse_id, day, "D"] for day in range(1, num_days + 1))
         e_total = sum(x[nurse_id, day, "E"] for day in range(1, num_days + 1))
@@ -1320,7 +1402,9 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         max_night = model.NewIntVar(0, num_days, "general_max_night")
         model.AddMinEquality(min_night, general_night_totals)
         model.AddMaxEquality(max_night, general_night_totals)
-        model.Add(max_night - min_night <= 1)
+        night_gap = model.NewIntVar(0, num_days, "general_night_gap")
+        model.Add(night_gap == max_night - min_night)
+        objective_terms.append(night_gap * 100)
 
     for day in range(1, num_days + 1):
         for shift in WORK_SHIFTS:
@@ -1781,6 +1865,42 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
             continue
         if any(value not in SHIFTS for value in row):
             violation("invalid_shift", f"{names[nurse_id]}에게 잘못된 근무 코드가 있습니다.", nurseId=nurse_id)
+        if previous_boundary_mode(payload) == "weak":
+            if previous_row and previous_row[-1] == "E" and row[0] == "D":
+                warnings.append({
+                    "type": "previous_e_to_d_warning",
+                    "warning_only": True,
+                    "nurseId": nurse_id,
+                    "name": names[nurse_id],
+                    "day": 1,
+                    "actual": "이전 달 E → 이번 달 D",
+                    "preferred": "E 다음날 D 피하기",
+                    "message": f"{names[nurse_id]}의 이전 달 말일 E 다음에 이번 달 1일 D가 배정되었습니다.",
+                })
+            if previous_row and previous_row[-1] == "N" and row[0] in {"D", "E"}:
+                warnings.append({
+                    "type": "previous_n_to_de_warning",
+                    "warning_only": True,
+                    "nurseId": nurse_id,
+                    "name": names[nurse_id],
+                    "day": 1,
+                    "actual": f"N → {row[0]}",
+                    "preferred": "N 연속 또는 OFF",
+                    "message": f"{names[nurse_id]}의 이전 달 말일 N 다음에 이번 달 1일 {row[0]}가 배정되었습니다.",
+                })
+            if previous_row and previous_row[-1] == "N":
+                recovery_preview = row[:2]
+                if len(recovery_preview) == 2 and recovery_preview != ["OFF", "OFF"] and row[0] != "N":
+                    warnings.append({
+                        "type": "previous_n_recovery_warning",
+                        "warning_only": True,
+                        "nurseId": nurse_id,
+                        "name": names[nurse_id],
+                        "day": 1,
+                        "actual": "/".join(recovery_preview),
+                        "preferred": "OFF/OFF",
+                        "message": f"{names[nurse_id]}의 이전 달 N 후 이번 달 초 OFF 2일이 제공되지 않았습니다.",
+                    })
         if previous_ends_evening and row[0] == "D":
             violation(
                 "PREVIOUS_E_TO_D",
@@ -1823,26 +1943,28 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                     required=expected_shift,
                 )
 
-        counts = Counter(row)
+        end_day = nurse_end_day(payload, nurse, num_days)
+        counts = Counter(row[:end_day])
         counts_summary.append({"nurseId": nurse_id, "name": names[nurse_id], **{s: counts[s] for s in SHIFTS}})
-        allowed_off_counts = {minimum_off, max(0, minimum_off - 1)}
+        active_off_target = nurse_active_off_target(payload, nurse, num_days, minimum_off)
+        allowed_off_counts = {active_off_target, max(0, active_off_target - 1)}
         if counts["OFF"] not in allowed_off_counts:
             violation(
                 "off_count_mismatch",
-                f"{names[nurse_id]} OFF {counts['OFF']}개 / 허용 {minimum_off}개 또는 {max(0, minimum_off - 1)}개",
+                f"{names[nurse_id]} OFF {counts['OFF']}개 / 허용 {active_off_target}개 또는 {max(0, active_off_target - 1)}개",
                 nurseId=nurse_id,
                 name=names[nurse_id],
                 actual=counts["OFF"],
-                required=f"{minimum_off} 또는 {max(0, minimum_off - 1)}",
+                required=f"{active_off_target} 또는 {max(0, active_off_target - 1)}",
             )
-        elif minimum_off > 0 and counts["OFF"] == minimum_off - 1:
+        elif active_off_target > 0 and counts["OFF"] == active_off_target - 1:
             warnings.append({
                 "type": "off_one_below_target",
-                "message": f"{names[nurse_id]} OFF가 목표 {minimum_off}개보다 1개 적은 {counts['OFF']}개입니다.",
+                "message": f"{names[nurse_id]} OFF가 목표 {active_off_target}개보다 1개 적은 {counts['OFF']}개입니다.",
                 "nurseId": nurse_id,
                 "name": names[nurse_id],
                 "actual": counts["OFF"],
-                "preferred": minimum_off,
+                "preferred": active_off_target,
                 "warning_only": True,
             })
         for shift in ("D", "E"):
@@ -1933,7 +2055,21 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                         break
                     previous_work += 1
             combined_work_length = work_length + previous_work
-            if combined_work_length > 5:
+            if combined_work_length > 5 and previous_work:
+                warnings.append({
+                    "type": "previous_month_consecutive_work_preference",
+                    "warning_only": True,
+                    "nurseId": nurse_id,
+                    "day": work_start + 1,
+                    "actual": combined_work_length,
+                    "preferred": "5 이하",
+                    "boundary": True,
+                    "message": (
+                        f"{names[nurse_id]} 이전 달부터 이어진 연속근무가 "
+                        f"{combined_work_length}일입니다."
+                    ),
+                })
+            elif combined_work_length > 5:
                 violation(
                     (
                         "previous_month_consecutive_work_preference"
