@@ -17,6 +17,7 @@ WORK_GROUPS = ("charge", "middle", "junior")
 LEE_HYEMI = "이혜미"
 DEFAULT_TIME_LIMIT_SECONDS = 120
 MAX_GENERAL_NIGHT_GAP = 2
+NIGHT_GAP_EXCESS_PENALTY = 1_000_000
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nurse-autoschedule")
@@ -1090,6 +1091,8 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     request_unmet_terms: list[cp_model.LinearExpr] = []
     de_balance_vars: dict[str, tuple[cp_model.LinearExpr, cp_model.LinearExpr, cp_model.IntVar]] = {}
     off_shortfall_vars: dict[str, cp_model.IntVar] = {}
+    night_gap: cp_model.IntVar | None = None
+    night_gap_excess: cp_model.IntVar | None = None
 
     def soft_pattern(
         name: str,
@@ -1405,11 +1408,13 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         model.AddMaxEquality(max_night, general_night_totals)
         night_gap = model.NewIntVar(0, num_days, "general_night_gap")
         model.Add(night_gap == max_night - min_night)
-        # Keep the CP-SAT model and post-solve validation on the same rule.
-        # A two-Night spread gives the solver room to satisfy daily Night staffing
-        # while preserving the mandatory 2-3 Night blocks and recovery OFF days.
-        model.Add(night_gap <= MAX_GENERAL_NIGHT_GAP)
-        objective_terms.append(night_gap * 100)
+        night_gap_excess = model.NewIntVar(
+            0, num_days, "general_night_gap_excess"
+        )
+        model.AddMaxEquality(
+            night_gap_excess,
+            [night_gap - MAX_GENERAL_NIGHT_GAP, 0],
+        )
 
     for day in range(1, num_days + 1):
         for shift in WORK_SHIFTS:
@@ -1463,6 +1468,11 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
     )
     repetition_objective = sum(repetition_terms)
     single_shift_objective = sum(single_shift_terms)
+    night_balance_objective = (
+        night_gap_excess * NIGHT_GAP_EXCESS_PENALTY + night_gap
+        if night_gap is not None and night_gap_excess is not None
+        else 0
+    )
     total_off_shortfall = sum(off_shortfall_vars.values())
     off_dispersion_terms: list[cp_model.IntVar] = []
     role_workers = {
@@ -1540,11 +1550,46 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             best_request = int(round(request_solver.Value(request_objective)))
             model.Add(request_objective <= best_request)
 
+    night_balance_baseline_solver = active_solver
+    night_balance_baseline_gap = (
+        int(night_balance_baseline_solver.Value(night_gap))
+        if night_gap is not None else 0
+    )
+    night_balance_baseline_penalty = (
+        int(round(night_balance_baseline_solver.Value(night_balance_objective)))
+        if night_gap is not None and night_gap_excess is not None else 0
+    )
+    night_balance_solver: cp_model.CpSolver | None = None
+    night_balance_status: cp_model.CpSolverStatus | None = None
+    night_balance_succeeded = False
+    if night_gap is not None and night_gap_excess is not None:
+        model.ClearHints()
+        for variable in x.values():
+            model.AddHint(variable, night_balance_baseline_solver.Value(variable))
+        model.Minimize(night_balance_objective)
+        night_balance_solver = cp_model.CpSolver()
+        night_balance_solver.parameters.max_time_in_seconds = min(
+            20, max(5, int(payload.timeLimitSeconds or DEFAULT_TIME_LIMIT_SECONDS) // 5)
+        )
+        night_balance_solver.parameters.num_search_workers = 8
+        night_balance_solver.parameters.random_seed = 202607
+        night_balance_status = night_balance_solver.Solve(model)
+        if night_balance_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            candidate_night_balance = int(round(
+                night_balance_solver.Value(night_balance_objective)
+            ))
+            if candidate_night_balance <= night_balance_baseline_penalty:
+                active_solver = night_balance_solver
+                active_status = night_balance_status
+                night_balance_succeeded = True
+                model.Add(night_balance_objective <= candidate_night_balance)
+
     balance_baseline_solver = active_solver
     balance_solver: cp_model.CpSolver | None = None
     balance_status: cp_model.CpSolverStatus | None = None
     balance_succeeded = False
-    if de_balance_vars and request_succeeded:
+    night_stage_ready = night_gap is None or night_balance_succeeded
+    if de_balance_vars and request_succeeded and night_stage_ready:
         model.ClearHints()
         for variable in x.values():
             model.AddHint(variable, balance_baseline_solver.Value(variable))
@@ -1726,6 +1771,23 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
             ),
             "fallback_used": not balance_succeeded,
         },
+        "night_balance_summary": {
+            "target_max_gap": MAX_GENERAL_NIGHT_GAP,
+            "before_gap": night_balance_baseline_gap,
+            "after_gap": (
+                int(active_solver.Value(night_gap))
+                if night_gap is not None else 0
+            ),
+            "status": (
+                night_balance_solver.StatusName(night_balance_status)
+                if night_balance_solver is not None
+                and night_balance_status is not None
+                else "SKIPPED"
+            ),
+            "fallback_used": (
+                night_gap is not None and not night_balance_succeeded
+            ),
+        },
         "soft_quality_summary": {
             "baseline_penalty": quality_baseline_value,
             "final_penalty": int(round(active_solver.Value(other_quality_objective))),
@@ -1854,6 +1916,7 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
     staffing_summary: list[dict[str, Any]] = []
     grade_summary: list[dict[str, Any]] = []
     counts_summary: list[dict[str, Any]] = []
+    boundary_mode = previous_boundary_mode(payload)
 
     def violation(kind: str, message: str, **details: Any) -> None:
         hard.append({"type": kind, "message": message, **details})
@@ -1870,7 +1933,7 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
             continue
         if any(value not in SHIFTS for value in row):
             violation("invalid_shift", f"{names[nurse_id]}에게 잘못된 근무 코드가 있습니다.", nurseId=nurse_id)
-        if previous_boundary_mode(payload) == "weak":
+        if boundary_mode == "weak":
             if previous_row and previous_row[-1] == "E" and row[0] == "D":
                 warnings.append({
                     "type": "previous_e_to_d_warning",
@@ -1913,7 +1976,12 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
                 nurseId=nurse_id,
                 day=1,
             )
-        if previous_row and previous_row[-1] == "N" and row[0] in {"D", "E"}:
+        if (
+            boundary_mode != "weak"
+            and previous_row
+            and previous_row[-1] == "N"
+            and row[0] in {"D", "E"}
+        ):
             violation(
                 "PREVIOUS_N_TO_DE",
                 f"{names[nurse_id]}의 이전 달 말일 N 다음에 이번 달 1일 {row[0]}가 배정되었습니다.",
@@ -2241,16 +2309,19 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
         if nurse_name(n) != LEE_HYEMI
         and nurse_end_day(payload, n, num_days) >= num_days
     ]
-    if (
-        general_nights
-        and max(general_nights) - min(general_nights) > MAX_GENERAL_NIGHT_GAP
-    ):
-        violation(
-            "night_distribution",
-            f"일반 직원 Night 횟수 편차가 {max(general_nights) - min(general_nights)}회입니다.",
-            actual=max(general_nights) - min(general_nights),
-            required=f"{MAX_GENERAL_NIGHT_GAP} 이하",
-        )
+    if general_nights:
+        general_night_gap = max(general_nights) - min(general_nights)
+        if general_night_gap > MAX_GENERAL_NIGHT_GAP:
+            warnings.append({
+                "type": "night_distribution_warning",
+                "warning_only": True,
+                "message": (
+                    f"일반 직원 Night 횟수 편차가 {general_night_gap}회입니다. "
+                    f"권장 편차는 {MAX_GENERAL_NIGHT_GAP}회 이내입니다."
+                ),
+                "actual": general_night_gap,
+                "preferred": f"{MAX_GENERAL_NIGHT_GAP} 이하",
+            })
 
     return {
         "hard_violations": hard,
