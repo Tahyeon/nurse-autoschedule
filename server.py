@@ -1404,6 +1404,9 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         model.AddMaxEquality(max_night, general_night_totals)
         night_gap = model.NewIntVar(0, num_days, "general_night_gap")
         model.Add(night_gap == max_night - min_night)
+        # Validation treats a difference above one Night as a hard violation.
+        # Keep the CP-SAT model and post-solve validation on the same rule.
+        model.Add(night_gap <= 1)
         objective_terms.append(night_gap * 100)
 
     for day in range(1, num_days + 1):
@@ -2232,7 +2235,9 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
 
     general_nights = [
         Counter(schedule.get(str(n["id"]), []))["N"]
-        for n in workers if nurse_name(n) != LEE_HYEMI
+        for n in workers
+        if nurse_name(n) != LEE_HYEMI
+        and nurse_end_day(payload, n, num_days) >= num_days
     ]
     if general_nights and max(general_nights) - min(general_nights) > 1:
         violation(
