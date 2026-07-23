@@ -16,6 +16,7 @@ WORK_SHIFTS = ("D", "E", "N")
 WORK_GROUPS = ("charge", "middle", "junior")
 LEE_HYEMI = "이혜미"
 DEFAULT_TIME_LIMIT_SECONDS = 120
+MAX_GENERAL_NIGHT_GAP = 2
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nurse-autoschedule")
@@ -1404,9 +1405,10 @@ def solve(payload: SolveRequest) -> dict[str, Any]:
         model.AddMaxEquality(max_night, general_night_totals)
         night_gap = model.NewIntVar(0, num_days, "general_night_gap")
         model.Add(night_gap == max_night - min_night)
-        # Validation treats a difference above one Night as a hard violation.
         # Keep the CP-SAT model and post-solve validation on the same rule.
-        model.Add(night_gap <= 1)
+        # A two-Night spread gives the solver room to satisfy daily Night staffing
+        # while preserving the mandatory 2-3 Night blocks and recovery OFF days.
+        model.Add(night_gap <= MAX_GENERAL_NIGHT_GAP)
         objective_terms.append(night_gap * 100)
 
     for day in range(1, num_days + 1):
@@ -2239,12 +2241,15 @@ def validate_schedule(payload: SolveRequest, schedule: dict[str, list[str]]) -> 
         if nurse_name(n) != LEE_HYEMI
         and nurse_end_day(payload, n, num_days) >= num_days
     ]
-    if general_nights and max(general_nights) - min(general_nights) > 1:
+    if (
+        general_nights
+        and max(general_nights) - min(general_nights) > MAX_GENERAL_NIGHT_GAP
+    ):
         violation(
             "night_distribution",
             f"일반 직원 Night 횟수 편차가 {max(general_nights) - min(general_nights)}회입니다.",
             actual=max(general_nights) - min(general_nights),
-            required="1 이하",
+            required=f"{MAX_GENERAL_NIGHT_GAP} 이하",
         )
 
     return {
